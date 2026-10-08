@@ -99,6 +99,18 @@ struct Stats(Movable):
         self.reads_mapped = 0
         self.reads_total = 0
 
+    def merge(mut self, o: Stats):
+        self.templates += o.templates
+        self.mate1_mapped += o.mate1_mapped
+        self.mate2_mapped += o.mate2_mapped
+        self.proper += o.proper
+        self.both_mapped += o.both_mapped
+        self.one_mapped += o.one_mapped
+        self.unmapped += o.unmapped
+        self.spliced_mates += o.spliced_mates
+        self.reads_mapped += o.reads_mapped
+        self.reads_total += o.reads_total
+
 
 def load_cand(recs: List[Int32], slot: Int, c: Int, ref_: Reference) -> Cand:
     var off = slot * REC_STRIDE + c * OUT_STRIDE

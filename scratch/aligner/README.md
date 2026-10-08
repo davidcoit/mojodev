@@ -156,13 +156,13 @@ Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
 | reference + index | ~3 s |
 | phase A, junction discovery on first 2 M pairs | 4.4-5.7 s |
 | FASTQ read + parse + 4-bit pack (9.5 GB of text), multi-threaded | 2.6-4.8 s (was 15-21 s serial) |
-| **GPU alignment, 26.4 M reads** | **6.8-8.2 s (3.2-3.9 M reads/s)**, run-to-run variation on the shared GPU |
-| pair resolution + SAM write (2.1 GB), single-threaded | 6.5-9.4 s |
-| **total** | **27-31 s** (serial reader: 38-53 s; 43.6 s in a same-session A/B) |
+| **GPU alignment, 26.4 M reads** | **6.8-8.6 s (3.1-3.9 M reads/s)**, run-to-run variation on the shared GPU |
+| pair resolution + SAM format + write (2.1 GB), multi-threaded | 2.7-4.3 s (was 6.5-9.4 s serial) |
+| **total** | **23-24 s** (serial FASTQ + serial SAM: 38-53 s; 43.6 s in a same-session A/B) |
 
 | | GPU aligner | minimap2 2.28 `splice:sr`, 24 threads |
 |---|---|---|
-| wall time | 27-31 s | 125 s (1,790 CPU-s) |
+| wall time | 23-24 s | 125 s (1,790 CPU-s) |
 | reads mapped | 99.82% | 98.39% |
 | MAPQ >= 10 | 96.4% | 96.8% |
 | proper pairs | 98.95% | n/a (see below) |
@@ -220,12 +220,12 @@ Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
 - Residual junction noise: singleton introns are still ~21% motif-less (see above). Real
   trans-splicing (SL1/SL2 leaders) and operons also produce legitimate odd junctions in
   *C. elegans*, so some of this may be biology rather than error.
-- Host work is still ~half of a real run: single-threaded pairing + SAM writing (6.5-9.4 s)
-  and junction discovery on a leading sample (3.3 s, which re-aligns those templates). The
-  FASTQ side was the first target: one serial `read()` ran at ~0.5 GB/s and was nearly all
-  of the old 15-21 s "parse"; concurrent ranged reads (~2.2 GB/s) plus parallel indexing and
-  parsing cut it to 2.6-4.8 s. Output is byte-identical to the serial reader on all 13.2 M
-  real pairs. Reading and parsing are not overlapped with GPU work, by choice.
+- Host work is still about half of a real run: startup (genome + index, ~3 s), junction
+  discovery on a leading sample (3.4-4.1 s, which re-aligns those templates and counts
+  junctions in a single-threaded dictionary), FASTQ read + parse (2.3 s) and pairing + SAM
+  (2.7-4.3 s). The FASTQ and SAM stages are multi-threaded and byte-identical to the serial
+  versions on all 13.2 M real pairs; the GPU alignment (7-9 s) is now the largest single
+  stage. Reading and parsing are deliberately not overlapped with GPU work.
 - One thread per read with global-memory scratch; no shared memory or warp-cooperative
   chaining. The de novo end search (up to 10 kb) makes de novo alignment ~2.4x slower than
   the junction-aware pass.
@@ -249,3 +249,6 @@ Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
   code untouched; same-session A/B against the serial reader: GPU kernel time equal (8.2 s vs
   7.8-8.2 s), wall 43.6 s -> 26.8-31.5 s. `tools/build_head.sh REV` builds an older commit for
   A/B output comparisons.
+- **2026-10-08 (later still)**: pairing + SAM formatting parallelised (48 tasks per chunk, each
+  with its own output buffer and counters, concatenated in order): 6.5-9.4 s -> 2.7-4.3 s;
+  real-run wall 23-24 s; output byte-identical.

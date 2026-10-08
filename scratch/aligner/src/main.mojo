@@ -23,6 +23,7 @@ from nt4 import PU8, nt4_bytes
 from index import Reference, MinimizerIndex, load_fasta, build_index
 from fastq import FastqReader, read_templates, build_lut, NAME_STRIDE
 from junctions import JunctionCounter, JunctionDB
+from max.algorithm import sync_parallelize
 from samout import Stats, write_template, put_str
 from kernels import (
     align_kernel,
@@ -34,6 +35,7 @@ from kernels import (
 )
 
 comptime BLOCK = 128
+comptime SAM_TASKS = 48  # parallel pairing + SAM formatting tasks per chunk
 
 
 def secs(t0: Int) -> Float64:
@@ -246,6 +248,11 @@ def main() raises:
     of.write_bytes(sam)
     sam.clear()
     var stats = Stats()
+    var task_bufs = List[List[UInt8]]()
+    var task_stats = List[Stats]()
+    for _ in range(SAM_TASKS):
+        task_bufs.append(List[UInt8](capacity=(chunk // SAM_TASKS + 1) * 260 * stride))
+        task_stats.append(Stats())
     var t_parse = 0.0
     var t_pair = 0.0
     ga.kernel_secs = 0.0
@@ -258,10 +265,22 @@ def main() raises:
             break
         ga.run(ctx, h_reads, h_rlen, h_out, n * stride)
         t0 = perf_counter_ns()
-        for t in range(n):
-            write_template(sam, h_out, t, paired, max_frag, ref_, names, name_off[t], name_len[t], stats)
-        of.write_bytes(sam)
-        sam.clear()
+        var tasks = min(SAM_TASKS, n)
+        var per = (n + tasks - 1) // tasks
+        for w in range(tasks):
+            task_bufs[w].clear()
+
+        def emit(w: Int) {mut task_bufs, mut task_stats, h_out, names, name_off, name_len, ref_, per, n, paired, max_frag}:
+            var a = w * per
+            var z = min(a + per, n)
+            for t in range(a, z):
+                write_template(task_bufs[w], h_out, t, paired, max_frag, ref_, names, name_off[t], name_len[t], task_stats[w])
+
+        sync_parallelize(emit, tasks)
+        for w in range(tasks):
+            of.write_bytes(task_bufs[w])
+            stats.merge(task_stats[w])
+            task_stats[w] = Stats()
         t_pair += secs(t0)
         total_t += n
     of.close()

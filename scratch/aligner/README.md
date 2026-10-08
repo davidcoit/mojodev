@@ -1,9 +1,10 @@
 # GPU splice-aware nucleotide aligner (Mojo)
 
-A prototype that aligns RNA-seq reads to a genome on the GPU: **4-bit nucleotide
-type → minimizer index → seed/chain → splice-aware breakpoint refinement**, all
-in Mojo 1.1 on an RTX 3080. Test reference is *C. elegans* WBcel235 (100.3 Mbp);
-test reads are simulated spliced reads with known truth.
+A prototype that aligns single-end or **paired-end** RNA-seq reads to a genome on the
+GPU: **4-bit nucleotide type → minimizer index → seed/chain → splice-aware breakpoint
+refinement → pair resolution**, all in Mojo 1.1 on an RTX 3080. Test reference is
+*C. elegans* WBcel235 (100.3 Mbp). Test reads: simulated spliced reads/pairs with known
+truth, plus a real 13.2 M-pair *C. elegans* RNA-seq run (SRR10065383).
 
 Original brief: `aligner-instructions.txt`.
 
@@ -12,14 +13,24 @@ Original brief: `aligner-instructions.txt`.
 ```bash
 cd scratch/aligner
 ./setup.sh            # venv with max.gpu, genome + GTF, prebuilt minimap2 (once)
-./run.sh 200000       # build, simulate 200k reads, align, score
+./run.sh 200000 se    # build, simulate 200k single-end reads, align, score
+./run.sh 200000 pe    # same with 200k simulated read pairs
+tools/get_real_pe.sh  # (optional) real paired-end run SRR10065383 -> /root/aligner-data
 ```
 
 `run.sh` pins `CUDA_VISIBLE_DEVICES=0`. This container exports it as `all`, which
 is not valid for CUDA and makes `cuInit` fail with error 100 (no device) even
 though `nvidia-smi` works.
 
-Direct use: `./build_main REF.fa READS.fastq OUT.sam [batch=200000] [passes=2] [min_junction_support=1]`
+Direct use:
+
+```bash
+./build_main REF.fa OUT.sam READS_1.fastq [READS_2.fastq] \
+    [--chunk 500000] [--jn-sample 2000000] [--min-support 1] [--max-frag 60000]
+```
+
+FASTQ is streamed in chunks, so input size is not limited by VRAM (plain FASTQ only,
+no gzip; reads ≤ 256 bases). With two files the run is paired-end.
 
 ## Layout
 
@@ -28,12 +39,16 @@ Direct use: `./build_main REF.fa READS.fastq OUT.sam [batch=200000] [passes=2] [
 | `src/nt4.mojo` | 4-bit encoding (A=0 C=1 G=2 T=3 N=4, codes 5–15 reserved for IUPAC), 2 bases/byte, pointer helpers usable on host and device |
 | `src/minimizer.mojo` | canonical (k=15, w=8) minimizer scanner; the *same* function indexes the genome and seeds reads |
 | `src/index.mojo` | FASTA → packed genome; minimizer index as a counting-sorted bucket table (2^24 buckets) |
-| `src/kernels.mojo` | the GPU kernel: one thread per read |
-| `src/junctions.mojo` | pass-1 junction collection, radix sort, for the second pass |
-| `src/main.mojo` | driver: parse FASTQ → pack → batches → 2 passes → SAM |
+| `src/kernels.mojo` | the GPU kernel: one thread per read, up to 2 candidate alignments per read |
+| `src/junctions.mojo` | junction counting across chunks, radix-sorted table for the junction-aware pass |
+| `src/fastq.mojo` | streaming FASTQ reader that packs bases straight into 4-bit slots |
+| `src/samout.mojo` | pair resolution (host) and SAM writer |
+| `src/main.mojo` | driver: GPU state, phase A (junction discovery), phase B (stream, align, pair, write) |
 | `src/test_nt4.mojo` | unit tests (packing, canonical-minimizer symmetry, density, N handling) |
-| `tools/simulate_reads.py` | spliced read simulator from GTF (errors, indels, Ns, 36% spliced) |
-| `tools/score_sam.py` | scores a SAM against simulation truth |
+| `tools/simulate_reads.py`, `tools/simulate_pairs.py` | spliced single-end / paired-end read simulators from a GTF (errors, indels, Ns) |
+| `tools/score_sam.py` | scores a SAM against simulation truth (per mate and per pair) |
+| `tools/eval_real.py`, `tools/only_mine.py` | truth-free evaluation on real data; mate-by-mate comparison of two SAMs |
+| `tools/get_real_pe.sh` | fetch + convert the real run |
 | `tools/bench_minimap2*.sh` | CPU baseline |
 
 ## How the aligner works
@@ -55,18 +70,34 @@ Per read (one GPU thread each):
 5. **MAPQ** from the best chain vs the best chain *outside its own reference
    span*, so tandem duplicates count as competition.
 
-**Two-pass (STAR-style)**: pass 1 aligns de novo; junctions seen in unique
-alignments with ≥12 bp flanks are tabulated and pass 2 uses them to place short
-overhangs that de novo search cannot do safely.
+**Junction-aware second stage (STAR-style)**: phase A aligns the first 2 M templates de
+novo; junctions seen in unique alignments with ≥12 bp flanks (kept if canonical, or seen
+by ≥3 reads) are tabulated, and the main pass uses them to place short overhangs that
+de novo search cannot do safely.
 
-**Memory**: genome 50 MB (4-bit) + index 246 MB. For 5M reads about 3.1 GB of
-VRAM is allocated (reads 640 MB, output records 960 MB, per-batch scratch 1.2 GB).
-Everything fits in the ~7 GB free on the 10 GB card (3 GB is held by other
-processes). No pseudoalignment was needed; the whole genome is indexed.
+### Paired-end
 
-## Results (C. elegans, 100 bp simulated reads, 36% spliced, 0.5% subs, 0.05% indels, 0.1% N)
+Mates sit in adjacent GPU slots and are aligned independently, but each read returns
+its best chain **and** the best chain at a different locus (2 candidate alignments).
+On the host, every (mate 1 candidate, mate 2 candidate) combination is scored:
+chain scores + 20 if compatible (same chromosome, opposite strands, forward mate not
+past the end of the reverse mate, genomic span ≤ 60 kb). The best combination wins;
+the runner-up combination sets a pair-level MAPQ, so a mate that is ambiguous on its
+own is resolved by its partner (a mate gets `max(own MAPQ, pair MAPQ)` in a proper
+pair). SAM output has correct FLAG bits, RNEXT/PNEXT, and TLEN (genomic span,
+introns included). An unmapped mate is placed at its partner's position.
 
-5,000,000 reads, final build:
+**Memory**: genome 50 MB (4-bit) + index 246 MB, plus about 1.4 GB of per-chunk buffers
+at the default 500 k templates (1 M reads: reads 128 MB, 2 candidate records 384 MB,
+scratch 1.2 GB). Usage is independent of input size, and everything fits in the ~7 GB
+free on the 10 GB card (3 GB is held by other processes). No pseudoalignment was needed;
+the whole genome is indexed.
+
+## Results
+
+### Single-end, simulated (100 bp, 36% spliced, 0.5% subs, 0.05% indels, 0.1% N)
+
+5,000,000 reads (measured with the earlier in-memory driver; junction table built from all reads):
 
 | stage | time |
 |---|---|
@@ -106,6 +137,55 @@ On 200k reads the same ordering holds (86.0% vs 66.1% exact junctions; 0.15 s GP
 - Truth for reads containing an indel error is shifted by 1 bp, so the `blocks`
   column understates accuracy; `junctions` is the meaningful column.
 
+### Paired-end, simulated (200 k pairs, 2 x 100 bp, fragments 250 +- 50 bp)
+
+| metric | value |
+|---|---|
+| both mates mapped | 99.99% |
+| flagged proper pair | 99.78% |
+| both mates at the correct locus | 98.63% (remaining misses are almost all identical tandem duplicates, MAPQ < 10) |
+| spliced mates, exact junction set | 86.8% |
+| wrong locus among MAPQ >= 10 | 12 of 383,922 mates |
+
+### Paired-end, real: *C. elegans* N2, SRR10065383 (13,185,419 pairs x 101 bp, HiSeq 4000)
+
+Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
+
+| stage | time |
+|---|---|
+| reference + index | ~3 s |
+| phase A, junction discovery on first 2 M pairs | 4.4-5.7 s |
+| FASTQ parse + 4-bit pack (9.5 GB of text) | 15-21 s |
+| **GPU alignment, 26.4 M reads** | **6.8-6.9 s (3.8-3.9 M reads/s)** |
+| pair resolution + SAM write (2.1 GB) | 6.7-7.2 s |
+| **total** | **38-46 s** |
+
+| | GPU aligner | minimap2 2.28 `splice:sr`, 24 threads |
+|---|---|---|
+| wall time | 38-46 s | 125 s (1,790 CPU-s) |
+| reads mapped | 99.82% | 98.39% |
+| MAPQ >= 10 | 96.4% | 96.8% |
+| proper pairs | 98.95% | n/a (see below) |
+| spliced reads | 8.10 M (30.8%) | 6.27 M (24.2%) |
+| intron observations on annotated introns | 98.70% | 99.35% |
+| distinct introns / annotated | 122.5 k / 67.5% | 95.2 k / 86.1% |
+| non-canonical motif, all distinct introns | 13.6% | 3.0% |
+| insert size (unspliced proper pairs) | median 154, IQR 127-207 | n/a |
+
+- **minimap2 cannot align spliced paired-end reads**: it errors with `--splice and --frag
+  should not be specified at the same time`, and `splice:sr` silently treats two files as
+  independent single-end reads. The baseline above is that mode, so it has no pairing
+  information and its SAM carries SEQ/QUAL (4x larger than mine, which writes `*`).
+- Per-mate agreement: of 25.9 M mates mapped by both, 95.5% start at the same position
+  (+-5 bp); the rest are mostly soft-clip vs short-overhang differences. 376 k mates are
+  mapped only by the GPU aligner (315 only by minimap2); 85% of those carry the proper-pair
+  flag and 87% have MAPQ >= 10, consistent with real rescues of clipped or low-quality mates
+  by pairing and the junction table, though there is no truth to confirm it.
+- **There is no ground truth on real data.** The GPU aligner is more sensitive (more spliced
+  reads, more mates mapped) but noisier: 13.6% of its distinct introns lack a canonical motif
+  against 3.0% for minimap2. Those are mostly singletons (98.7% of intron observations are on
+  annotated introns), but the precision/recall trade-off is not settled.
+
 ## Mojo 1.1 notes (what changed vs older docs)
 
 - GPU modules are in the **`max`** package: `from max.gpu.host import DeviceContext`,
@@ -126,16 +206,22 @@ On 200k reads the same ordering holds (86.0% vs 66.1% exact junctions; 0.15 s GP
 
 ## Limitations and next steps
 
-- Reads ≤ 256 bases (fixed 128-byte slots); longer reads are left unmapped.
-  Single-end only. Output is SAM with `*` for SEQ/QUAL.
-- One thread per read with global-memory scratch; no attempt yet to use shared
-  memory, warp-cooperative chaining, or overlap copies with compute.
-- The de novo end search (up to 10 kb) is why pass 1 is ~2.4× slower than pass 2.
-- Index construction is on the host (2.2 s); it is embarrassingly parallel and
-  could move to the GPU. FASTQ parsing is now the largest host cost.
-- Not done: paired-end, base qualities, gapped (banded) extension within exons
-  beyond the single breakpoint scan, non-canonical splice sites on the de novo
-  path, real RNA-seq data, comparison with STAR/HISAT2.
+- Reads <= 256 bases (fixed 128-byte slots); longer reads are left unmapped. SAM writes `*`
+  for SEQ/QUAL. Plain FASTQ only (no gzip); `tools/get_real_pe.sh` produces plain FASTQ.
+- No mate rescue: if one mate cannot be seeded (0.30% of real pairs) it stays unmapped
+  instead of being searched for near its partner. Library strandedness is not used.
+- Non-canonical intron noise: chain links across introns are not motif-checked, so some
+  low-support junctions with no GT..AG slip through. A motif or flank-length requirement at
+  breakpoint refinement is the obvious fix.
+- Host work now dominates a real run: single-threaded FASTQ parse (15-21 s of ~40 s) and
+  pairing + SAM (7 s). Overlapping parsing with GPU work, or a multi-threaded parser, would
+  cut the wall time roughly in half.
+- One thread per read with global-memory scratch; no shared memory or warp-cooperative
+  chaining. The de novo end search (up to 10 kb) makes de novo alignment ~2.4x slower than
+  the junction-aware pass.
+- Index construction is on the host (2 s) and could move to the GPU.
+- Not done: base qualities, long reads, comparison with STAR / HISAT2 (not installed),
+  differential-expression-grade evaluation of the real run.
 
 ## Log
 
@@ -144,3 +230,7 @@ On 200k reads the same ordering holds (86.0% vs 66.1% exact junctions; 0.15 s GP
   for user Mojo code did not apply. `workingmemory.md` was not updated: it exists
   only as an uncommitted file in the main checkout, not in this worktree. Add an
   entry there pointing to this directory.
+- **2026-10-08 (later)**: added paired-end support (two-candidate kernel output, host pair
+  resolution, streaming FASTQ, junction discovery on a sample), simulated pairs, and the real
+  run SRR10065383. Fixed along the way: this checkout is on a nearly full `C:\` mount, so
+  large data lives in `/root/aligner-data` (outside the repo).

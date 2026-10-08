@@ -34,7 +34,9 @@ comptime MIN_RESCUE = 8  # shortest overhang that end-rescue will try to place
 comptime MAX_RESCUE_INTRON = 10000
 comptime MIN_DB_OVERHANG = 3  # shortest overhang placed via a known junction
 
-comptime OUT_STRIDE = 48
+comptime OUT_STRIDE = 48  # ints per candidate alignment record
+comptime NCAND = 2
+comptime REC_STRIDE = OUT_STRIDE * NCAND
 comptime OUT_OPS = 16  # ops start at this slot
 comptime MAX_OPS = 30
 # Record slots:
@@ -330,6 +332,172 @@ def db_left(
     return best
 
 
+def build_alignment(
+    genome: PU8,
+    n: Int,
+    rd: PU8,
+    L: Int,
+    rev: Int,
+    ak: PU32,
+    aq: PI32,
+    ac: PI32,
+    m: Int,
+    best_f: Int,
+    second: Int,
+    n_junc: Int,
+    j_donor: PU32,
+    j_acc_of_donor: PU32,
+    j_acc: PU32,
+    j_donor_of_acc: PU32,
+    rec: PI32,
+):
+    """Turn a chain (anchor indices ac[0:m], ascending) into a CIGAR record."""
+    var ops = rec + OUT_OPS
+    var n_ops = 0
+    var first = Int(ac[0])
+    var r_first = Int(ak[first] & 0x7FFFFFFF)
+    var q_first = Int(aq[first])
+    var d_cur = r_first - q_first
+
+    var le = extend_left(genome, n, rd, L, rev, q_first, d_cur)
+    var qs = q_first - le
+    var ref_start = qs + d_cur
+    var emit_q = qs  # next query base to emit
+    var cov_q = q_first + MM_K  # end of what the current diagonal certainly covers
+    var nm = 0
+    var ref_span = 0
+    var rescued = 0
+    # Clipped / over-extended left end: try known junctions, then a de novo
+    # canonical-intron search, to place the first exon.
+    var rl = -1
+    var hi_l = min(qs + 8, q_first)
+    if n_junc > 0:
+        var lo_db = max(MIN_DB_OVERHANG, qs - 8)
+        if lo_db <= hi_l:
+            rl = db_left(genome, n, rd, L, rev, d_cur, lo_db, hi_l, n_junc, j_acc, j_donor_of_acc)
+    if rl < 0 and qs >= 4:
+        var lo_dn = max(MIN_RESCUE, qs - 4)
+        if lo_dn <= hi_l:
+            rl = rescue_left(genome, n, rd, L, rev, d_cur, lo_dn, hi_l)
+    if rl >= 0:
+        var bq = rl >> 32
+        var sp = rl & 0xFFFFFFFF
+        ref_start = sp - bq
+        nm += bq - count_matches(genome, n, rd, L, rev, 0, bq, sp - bq)
+        n_ops = push_op(ops, n_ops, OP_M, bq)
+        n_ops = push_op(ops, n_ops, OP_N, (bq + d_cur) - sp)
+        ref_span += bq + (bq + d_cur) - sp
+        emit_q = bq
+        rescued = 1
+    if rescued == 0:
+        n_ops = push_op(ops, n_ops, OP_S, qs)
+
+    for t in range(1, m):
+        var ai = Int(ac[t])
+        var rt = Int(ak[ai] & 0x7FFFFFFF)
+        var qt = Int(aq[ai])
+        var dt = rt - qt
+        if dt == d_cur:
+            cov_q = max(cov_q, qt + MM_K)
+            continue
+        var delta = dt - d_cur
+        var ins = 0
+        if delta < 0:
+            ins = -delta
+        # breakpoint search window on the query
+        var b_lo = min(cov_q, qt) - WIDEN
+        var b_hi = min(max(cov_q, qt) + WIDEN, qt + MM_K)
+        if ins > 0:
+            b_hi = qt - ins
+            b_lo = min(cov_q, b_hi) - WIDEN
+        b_lo = max(b_lo, emit_q)
+        if b_hi < b_lo:
+            b_hi = b_lo
+        # right-hand matches over the whole window, then slide the breakpoint
+        var right_total = count_matches(genome, n, rd, L, rev, b_lo + ins, b_hi + ins, dt)
+        var left = 0
+        var right_used = 0
+        var best_b = b_lo
+        var best_s = -1000
+        for b in range(b_lo, b_hi + 1):
+            var s = left + (right_total - right_used)
+            if delta >= MIN_INTRON:
+                s += splice_bonus(genome, n, b + d_cur, b + dt)
+            if s > best_s:
+                best_s = s
+                best_b = b
+            if b < b_hi:
+                left += is_match(r_get(rd, L, rev, b), g_get(genome, n, b + d_cur))
+                right_used += is_match(r_get(rd, L, rev, b + ins), g_get(genome, n, b + ins + dt))
+        # emit M up to the breakpoint, then the gap op
+        nm += (best_b - emit_q) - count_matches(genome, n, rd, L, rev, emit_q, best_b, d_cur)
+        n_ops = push_op(ops, n_ops, OP_M, best_b - emit_q)
+        ref_span += best_b - emit_q
+        if delta < 0:
+            n_ops = push_op(ops, n_ops, OP_I, ins)
+            nm += ins
+        elif delta < MIN_INTRON:
+            n_ops = push_op(ops, n_ops, OP_D, delta)
+            nm += delta
+            ref_span += delta
+        else:
+            n_ops = push_op(ops, n_ops, OP_N, delta)
+            ref_span += delta
+        emit_q = best_b + ins
+        d_cur = dt
+        cov_q = max(emit_q, qt + MM_K)
+
+    var re = extend_right(genome, n, rd, L, rev, cov_q, d_cur)
+    var q_end = min(cov_q + re, L)
+    var rr = -1
+    var lo_r = max(max(q_end - 8, cov_q - 3), emit_q + 1)
+    if n_junc > 0:
+        var hi_db = min(q_end + 4, L - MIN_DB_OVERHANG)
+        if lo_r <= hi_db:
+            rr = db_right(genome, n, rd, L, rev, d_cur, lo_r, hi_db, n_junc, j_donor, j_acc_of_donor)
+    if rr < 0 and L - q_end >= 4:
+        var hi = min(q_end + 4, L - MIN_RESCUE)
+        if lo_r <= hi:
+            rr = rescue_right(genome, n, rd, L, rev, d_cur, lo_r, hi)
+    if rr >= 0:
+        var bq = rr >> 32
+        var tp = rr & 0xFFFFFFFF
+        nm += (bq - emit_q) - count_matches(genome, n, rd, L, rev, emit_q, bq, d_cur)
+        n_ops = push_op(ops, n_ops, OP_M, bq - emit_q)
+        n_ops = push_op(ops, n_ops, OP_N, tp - (bq + d_cur))
+        nm += (L - bq) - count_matches(genome, n, rd, L, rev, bq, L, tp - bq)
+        n_ops = push_op(ops, n_ops, OP_M, L - bq)
+        ref_span += (bq - emit_q) + (tp - (bq + d_cur)) + (L - bq)
+    else:
+        nm += (q_end - emit_q) - count_matches(genome, n, rd, L, rev, emit_q, q_end, d_cur)
+        n_ops = push_op(ops, n_ops, OP_M, q_end - emit_q)
+        ref_span += q_end - emit_q
+        n_ops = push_op(ops, n_ops, OP_S, L - q_end)
+    if n_ops > MAX_OPS:
+        return
+
+    var mapq = 60
+    if second > 0:
+        var ratio = (second * 100) // best_f
+        if ratio >= 95:
+            mapq = 0
+        elif ratio >= 80:
+            mapq = 1
+        elif ratio >= 60:
+            mapq = 10
+        else:
+            mapq = 40
+    rec[O_STATUS] = 1
+    rec[O_STRAND] = Int32(rev)
+    rec[O_POS] = Int32(ref_start)
+    rec[O_MAPQ] = Int32(mapq)
+    rec[O_CHAIN] = Int32(best_f)
+    rec[O_NM] = Int32(nm)
+    rec[O_NOPS] = Int32(n_ops)
+    rec[O_SECOND] = Int32(second)
+    rec[O_SPAN] = Int32(ref_span)
+
+
 def align_kernel(
     genome: PU8,
     n_genome: Int32,
@@ -361,8 +529,8 @@ def align_kernel(
     var rid = lid + Int(base)  # global read index (reads / output are global)
     if rid >= Int(n_reads):
         return
-    var rec = out_buf + rid * OUT_STRIDE
-    for i in range(OUT_STRIDE):
+    var rec = out_buf + rid * REC_STRIDE
+    for i in range(REC_STRIDE):
         rec[i] = 0
     var L = Int(rlen[rid])
     if L < MM_K + 8 or L > MAXL:
@@ -464,7 +632,7 @@ def align_kernel(
     if best_f < MIN_CHAIN_SCORE:
         return
 
-    # backtrack, then reverse into ascending order
+    # backtrack the best chain, then reverse into ascending order
     var m = 0
     var cur = best_i
     while cur >= 0 and m < MAXA:
@@ -476,12 +644,13 @@ def align_kernel(
         ac[t] = ac[m - 1 - t]
         ac[m - 1 - t] = tmp
 
-    # second-best chain (for MAPQ): best f among anchors outside the best chain's
-    # own reference span, so tandem duplicates count as competing loci
+    # runner-up chain at a different locus: best f among anchors outside the best
+    # chain's own reference span, so tandem duplicates count as competing loci
     var best_strand = Int(ak[best_i] >> 31)
     var span_lo = Int(ak[Int(ac[0])] & 0x7FFFFFFF) - 2 * MM_K
     var span_hi = Int(ak[Int(ac[m - 1])] & 0x7FFFFFFF) + 3 * MM_K
     var second = 0
+    var second_i = -1
     for i in range(n_a):
         var inside = 0
         if Int(ak[i] >> 31) == best_strand:
@@ -490,150 +659,31 @@ def align_kernel(
                 inside = 1
         if inside == 0 and Int(af[i]) > second:
             second = Int(af[i])
+            second_i = i
 
-    # ---- 4/5: build the alignment from the chain
-    var rev = best_strand
-    var ops = rec + OUT_OPS
-    var n_ops = 0
-    var first = Int(ac[0])
-    var r_first = Int(ak[first] & 0x7FFFFFFF)
-    var q_first = Int(aq[first])
-    var d_cur = r_first - q_first
+    build_alignment(genome, n, rd, L, best_strand, ak, aq, ac, m, best_f, second, Int(n_junc), j_donor, j_acc_of_donor, j_acc, j_donor_of_acc, rec)
 
-    var le = extend_left(genome, n, rd, L, rev, q_first, d_cur)
-    var qs = q_first - le
-    var ref_start = qs + d_cur
-    var emit_q = qs  # next query base to emit
-    var cov_q = q_first + MM_K  # end of what the current diagonal certainly covers
-    var nm = 0
-    var ref_span = 0
-    var rescued = 0
-    # Clipped / over-extended left end: try known junctions, then a de novo
-    # canonical-intron search, to place the first exon.
-    var rl = -1
-    var hi_l = min(qs + 8, q_first)
-    if Int(n_junc) > 0:
-        var lo_db = max(MIN_DB_OVERHANG, qs - 8)
-        if lo_db <= hi_l:
-            rl = db_left(genome, n, rd, L, rev, d_cur, lo_db, hi_l, Int(n_junc), j_acc, j_donor_of_acc)
-    if rl < 0 and qs >= 4:
-        var lo_dn = max(MIN_RESCUE, qs - 4)
-        if lo_dn <= hi_l:
-            rl = rescue_left(genome, n, rd, L, rev, d_cur, lo_dn, hi_l)
-    if rl >= 0:
-        var bq = rl >> 32
-        var sp = rl & 0xFFFFFFFF
-        ref_start = sp - bq
-        nm += bq - count_matches(genome, n, rd, L, rev, 0, bq, sp - bq)
-        n_ops = push_op(ops, n_ops, OP_M, bq)
-        n_ops = push_op(ops, n_ops, OP_N, (bq + d_cur) - sp)
-        ref_span += bq + (bq + d_cur) - sp
-        emit_q = bq
-        rescued = 1
-    if rescued == 0:
-        n_ops = push_op(ops, n_ops, OP_S, qs)
-
-    for t in range(1, m):
-        var ai = Int(ac[t])
-        var rt = Int(ak[ai] & 0x7FFFFFFF)
-        var qt = Int(aq[ai])
-        var dt = rt - qt
-        if dt == d_cur:
-            cov_q = max(cov_q, qt + MM_K)
-            continue
-        var delta = dt - d_cur
-        var ins = 0
-        if delta < 0:
-            ins = -delta
-        # breakpoint search window on the query
-        var b_lo = min(cov_q, qt) - WIDEN
-        var b_hi = min(max(cov_q, qt) + WIDEN, qt + MM_K)
-        if ins > 0:
-            b_hi = qt - ins
-            b_lo = min(cov_q, b_hi) - WIDEN
-        b_lo = max(b_lo, emit_q)
-        if b_hi < b_lo:
-            b_hi = b_lo
-        # right-hand matches over the whole window, then slide the breakpoint
-        var right_total = count_matches(genome, n, rd, L, rev, b_lo + ins, b_hi + ins, dt)
-        var left = 0
-        var right_used = 0
-        var best_b = b_lo
-        var best_s = -1000
-        for b in range(b_lo, b_hi + 1):
-            var s = left + (right_total - right_used)
-            if delta >= MIN_INTRON:
-                s += splice_bonus(genome, n, b + d_cur, b + dt)
-            if s > best_s:
-                best_s = s
-                best_b = b
-            if b < b_hi:
-                left += is_match(r_get(rd, L, rev, b), g_get(genome, n, b + d_cur))
-                right_used += is_match(r_get(rd, L, rev, b + ins), g_get(genome, n, b + ins + dt))
-        # emit M up to the breakpoint, then the gap op
-        nm += (best_b - emit_q) - count_matches(genome, n, rd, L, rev, emit_q, best_b, d_cur)
-        n_ops = push_op(ops, n_ops, OP_M, best_b - emit_q)
-        ref_span += best_b - emit_q
-        if delta < 0:
-            n_ops = push_op(ops, n_ops, OP_I, ins)
-            nm += ins
-        elif delta < MIN_INTRON:
-            n_ops = push_op(ops, n_ops, OP_D, delta)
-            nm += delta
-            ref_span += delta
-        else:
-            n_ops = push_op(ops, n_ops, OP_N, delta)
-            ref_span += delta
-        emit_q = best_b + ins
-        d_cur = dt
-        cov_q = max(emit_q, qt + MM_K)
-
-    var re = extend_right(genome, n, rd, L, rev, cov_q, d_cur)
-    var q_end = min(cov_q + re, L)
-    var rr = -1
-    var lo_r = max(max(q_end - 8, cov_q - 3), emit_q + 1)
-    if Int(n_junc) > 0:
-        var hi_db = min(q_end + 4, L - MIN_DB_OVERHANG)
-        if lo_r <= hi_db:
-            rr = db_right(genome, n, rd, L, rev, d_cur, lo_r, hi_db, Int(n_junc), j_donor, j_acc_of_donor)
-    if rr < 0 and L - q_end >= 4:
-        var hi = min(q_end + 4, L - MIN_RESCUE)
-        if lo_r <= hi:
-            rr = rescue_right(genome, n, rd, L, rev, d_cur, lo_r, hi)
-    if rr >= 0:
-        var bq = rr >> 32
-        var tp = rr & 0xFFFFFFFF
-        nm += (bq - emit_q) - count_matches(genome, n, rd, L, rev, emit_q, bq, d_cur)
-        n_ops = push_op(ops, n_ops, OP_M, bq - emit_q)
-        n_ops = push_op(ops, n_ops, OP_N, tp - (bq + d_cur))
-        nm += (L - bq) - count_matches(genome, n, rd, L, rev, bq, L, tp - bq)
-        n_ops = push_op(ops, n_ops, OP_M, L - bq)
-        ref_span += (bq - emit_q) + (tp - (bq + d_cur)) + (L - bq)
-    else:
-        nm += (q_end - emit_q) - count_matches(genome, n, rd, L, rev, emit_q, q_end, d_cur)
-        n_ops = push_op(ops, n_ops, OP_M, q_end - emit_q)
-        ref_span += q_end - emit_q
-        n_ops = push_op(ops, n_ops, OP_S, L - q_end)
-    if n_ops > MAX_OPS:
-        return
-
-    var mapq = 60
-    if second > 0:
-        var ratio = (second * 100) // best_f
-        if ratio >= 95:
-            mapq = 0
-        elif ratio >= 80:
-            mapq = 1
-        elif ratio >= 60:
-            mapq = 10
-        else:
-            mapq = 40
-    rec[O_STATUS] = 1
-    rec[O_STRAND] = Int32(rev)
-    rec[O_POS] = Int32(ref_start)
-    rec[O_MAPQ] = Int32(mapq)
-    rec[O_CHAIN] = Int32(best_f)
-    rec[O_NM] = Int32(nm)
-    rec[O_NOPS] = Int32(n_ops)
-    rec[O_SECOND] = Int32(second)
-    rec[O_SPAN] = Int32(ref_span)
+    # candidate 1: the runner-up locus, if it is a credible alignment
+    if second_i >= 0 and second >= MIN_CHAIN_SCORE and 2 * second >= best_f:
+        var m2 = 0
+        var cur2 = second_i
+        while cur2 >= 0 and m2 < MAXA:
+            var in_span = 0
+            if Int(ak[cur2] >> 31) == best_strand:
+                var r3 = Int(ak[cur2] & 0x7FFFFFFF)
+                if r3 >= span_lo and r3 <= span_hi:
+                    in_span = 1
+            if in_span == 1:
+                break
+            ac[m2] = Int32(cur2)
+            m2 += 1
+            cur2 = Int(ap[cur2])
+        for t in range(m2 // 2):
+            var tmp2 = ac[t]
+            ac[t] = ac[m2 - 1 - t]
+            ac[m2 - 1 - t] = tmp2
+        if m2 > 0:
+            var rec2 = rec + OUT_STRIDE
+            for i in range(OUT_STRIDE):
+                rec2[i] = 0
+            build_alignment(genome, n, rd, L, Int(ak[second_i] >> 31), ak, aq, ac, m2, second, best_f, Int(n_junc), j_donor, j_acc_of_donor, j_acc, j_donor_of_acc, rec2)

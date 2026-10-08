@@ -1,33 +1,36 @@
-"""GPU splice-aware aligner.
+"""GPU splice-aware aligner (single-end or paired-end).
 
-Usage: main REF.fa READS.fastq OUT.sam [batch_reads=200000] [passes=2] [min_junction_support=1]
+Usage:
+    main REF.fa OUT.sam READS_1.fastq [READS_2.fastq] [options]
 
-Pass 1 aligns every read de novo.  Pass 2 (default) re-aligns with a table of the
-junctions pass 1 found, which lets reads with very short overhangs be placed.
+Options:
+    --chunk N         templates per GPU round trip (default 500000)
+    --jn-sample N     templates used for junction discovery before the main pass
+                      (default 2000000; 0 disables the junction table)
+    --min-support N   reads needed to keep a discovered junction (default 1)
+    --max-frag N      largest genomic span of a proper pair (default 60000)
+
+Phase A aligns the first --jn-sample templates de novo and tabulates the splice
+junctions they support.  Phase B streams the whole input in chunks, aligning with
+that junction table so reads with very short overhangs can be placed, then resolves
+pairs and writes SAM.  Mates are stored in adjacent slots (2t, 2t + 1).
 """
 from std.sys import argv
 from std.time import perf_counter_ns
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, DeviceBuffer
 
-from nt4 import PU8, nt4_from_ascii, nt4_set, nt4_bytes
-from index import load_fasta, build_index
-from junctions import collect_junctions
+from nt4 import PU8, nt4_bytes
+from index import Reference, MinimizerIndex, load_fasta, build_index
+from fastq import FastqReader
+from junctions import JunctionCounter, JunctionDB
+from samout import Stats, write_template, put_str
 from kernels import (
     align_kernel,
     RSTRIDE,
     MAXL,
     MAXM,
     MAXA,
-    OUT_STRIDE,
-    OUT_OPS,
-    O_STATUS,
-    O_STRAND,
-    O_POS,
-    O_MAPQ,
-    O_CHAIN,
-    O_NM,
-    O_NOPS,
-    O_SPAN,
+    REC_STRIDE,
 )
 
 comptime BLOCK = 128
@@ -37,241 +40,273 @@ def secs(t0: Int) -> Float64:
     return Float64(perf_counter_ns() - t0) / 1e9
 
 
-def put_str(mut buf: List[UInt8], s: String):
-    var b = s.as_bytes()
-    for i in range(len(b)):
-        buf.append(b[i])
+struct GpuAligner(Movable):
+    """Device-resident genome, index, junction table and per-chunk buffers."""
+    var n_bases: Int
+    var batch: Int
+    var n_junc: Int
+    var kernel_secs: Float64
+    var d_genome: DeviceBuffer[DType.uint8]
+    var d_bucket: DeviceBuffer[DType.uint32]
+    var d_ehash: DeviceBuffer[DType.uint32]
+    var d_epos: DeviceBuffer[DType.uint32]
+    var d_reads: DeviceBuffer[DType.uint8]
+    var d_rlen: DeviceBuffer[DType.int32]
+    var d_out: DeviceBuffer[DType.int32]
+    var d_mh: DeviceBuffer[DType.uint32]
+    var d_mp: DeviceBuffer[DType.uint32]
+    var d_ak: DeviceBuffer[DType.uint32]
+    var d_aq: DeviceBuffer[DType.int32]
+    var d_af: DeviceBuffer[DType.int32]
+    var d_ap: DeviceBuffer[DType.int32]
+    var d_ac: DeviceBuffer[DType.int32]
+    var d_jd: DeviceBuffer[DType.uint32]
+    var d_jda: DeviceBuffer[DType.uint32]
+    var d_ja: DeviceBuffer[DType.uint32]
+    var d_jad: DeviceBuffer[DType.uint32]
 
+    def __init__(out self, ctx: DeviceContext, ref_: Reference, idx: MinimizerIndex, max_slots: Int, batch: Int) raises:
+        self.n_bases = ref_.n_bases
+        self.batch = min(batch, max_slots)
+        self.n_junc = 0
+        self.kernel_secs = 0.0
+        self.d_genome = ctx.enqueue_create_buffer[DType.uint8](nt4_bytes(ref_.n_bases) + 1)
+        self.d_bucket = ctx.enqueue_create_buffer[DType.uint32](len(idx.bucket_off))
+        self.d_ehash = ctx.enqueue_create_buffer[DType.uint32](idx.n_entries)
+        self.d_epos = ctx.enqueue_create_buffer[DType.uint32](idx.n_entries)
+        ctx.enqueue_copy(self.d_genome, ref_.packed.unsafe_ptr())
+        ctx.enqueue_copy(self.d_bucket, idx.bucket_off.unsafe_ptr())
+        ctx.enqueue_copy(self.d_ehash, idx.ent_hash.unsafe_ptr())
+        ctx.enqueue_copy(self.d_epos, idx.ent_pos.unsafe_ptr())
+        self.d_reads = ctx.enqueue_create_buffer[DType.uint8](max_slots * RSTRIDE)
+        self.d_rlen = ctx.enqueue_create_buffer[DType.int32](max_slots)
+        self.d_out = ctx.enqueue_create_buffer[DType.int32](max_slots * REC_STRIDE)
+        self.d_mh = ctx.enqueue_create_buffer[DType.uint32](self.batch * MAXM)
+        self.d_mp = ctx.enqueue_create_buffer[DType.uint32](self.batch * MAXM)
+        self.d_ak = ctx.enqueue_create_buffer[DType.uint32](self.batch * MAXA)
+        self.d_aq = ctx.enqueue_create_buffer[DType.int32](self.batch * MAXA)
+        self.d_af = ctx.enqueue_create_buffer[DType.int32](self.batch * MAXA)
+        self.d_ap = ctx.enqueue_create_buffer[DType.int32](self.batch * MAXA)
+        self.d_ac = ctx.enqueue_create_buffer[DType.int32](self.batch * MAXA)
+        self.d_jd = ctx.enqueue_create_buffer[DType.uint32](1)
+        self.d_jda = ctx.enqueue_create_buffer[DType.uint32](1)
+        self.d_ja = ctx.enqueue_create_buffer[DType.uint32](1)
+        self.d_jad = ctx.enqueue_create_buffer[DType.uint32](1)
+        ctx.synchronize()
 
-def put_int(mut buf: List[UInt8], v: Int):
-    if v == 0:
-        buf.append(48)
-        return
-    var x = v
-    if x < 0:
-        buf.append(45)
-        x = -x
-    var start = len(buf)
-    while x > 0:
-        buf.append(UInt8(48 + x % 10))
-        x //= 10
-    # digits were appended least-significant first: reverse in place
-    var i = start
-    var j = len(buf) - 1
-    while i < j:
-        var t = buf[i]
-        buf[i] = buf[j]
-        buf[j] = t
-        i += 1
-        j -= 1
+    def set_junctions(mut self, ctx: DeviceContext, db: JunctionDB) raises:
+        self.n_junc = db.n
+        self.d_jd = ctx.enqueue_create_buffer[DType.uint32](len(db.donor))
+        self.d_jda = ctx.enqueue_create_buffer[DType.uint32](len(db.donor))
+        self.d_ja = ctx.enqueue_create_buffer[DType.uint32](len(db.donor))
+        self.d_jad = ctx.enqueue_create_buffer[DType.uint32](len(db.donor))
+        ctx.enqueue_copy(self.d_jd, db.donor.unsafe_ptr())
+        ctx.enqueue_copy(self.d_jda, db.acc_of_donor.unsafe_ptr())
+        ctx.enqueue_copy(self.d_ja, db.acc.unsafe_ptr())
+        ctx.enqueue_copy(self.d_jad, db.donor_of_acc.unsafe_ptr())
+        ctx.synchronize()
 
-
-def main() raises:
-    var args = argv()
-    if len(args) < 4:
-        print("usage: main REF.fa READS.fastq OUT.sam [batch_reads] [passes=2] [min_junction_support=1]")
-        return
-    var batch = 200000
-    if len(args) > 4:
-        batch = Int(String(args[4]))
-    var n_passes = 2
-    if len(args) > 5:
-        n_passes = Int(String(args[5]))
-    var min_support = 1
-    if len(args) > 6:
-        min_support = Int(String(args[6]))
-
-    var ctx = DeviceContext()
-    print("device:", ctx.name())
-
-    # ---- reference + index
-    var t0 = perf_counter_ns()
-    var ref_ = load_fasta(String(args[1]))
-    print("reference:", len(ref_.names), "sequences,", ref_.n_bases, "bases (", secs(t0), "s )")
-    var idx = build_index(ref_)
-
-    var d_genome = ctx.enqueue_create_buffer[DType.uint8](nt4_bytes(ref_.n_bases) + 1)
-    var d_bucket = ctx.enqueue_create_buffer[DType.uint32](len(idx.bucket_off))
-    var d_ehash = ctx.enqueue_create_buffer[DType.uint32](idx.n_entries)
-    var d_epos = ctx.enqueue_create_buffer[DType.uint32](idx.n_entries)
-    ctx.enqueue_copy(d_genome, ref_.packed.unsafe_ptr())
-    ctx.enqueue_copy(d_bucket, idx.bucket_off.unsafe_ptr())
-    ctx.enqueue_copy(d_ehash, idx.ent_hash.unsafe_ptr())
-    ctx.enqueue_copy(d_epos, idx.ent_pos.unsafe_ptr())
-    ctx.synchronize()
-    var index_mb = Float64(len(idx.bucket_off) * 4 + idx.n_entries * 8 + nt4_bytes(ref_.n_bases)) / 1e6
-    print("device index:", index_mb, "MB")
-
-    # ---- reads -> 4-bit packed slots
-    t0 = perf_counter_ns()
-    var fq = open(String(args[2]), "r")
-    var size = Int(fq.seek(0, 2))
-    _ = fq.seek(0, 0)
-    var data = List[UInt8](length=size, fill=0)
-    _ = fq.read(Span(data))
-    var dp = data.unsafe_ptr()
-    print("  fastq read:", secs(t0), "s")
-    var count = 0
-    for i in range(size):
-        if dp[i] == 10:
-            count += 1
-    var n_reads = count // 4
-    var h_reads = List[UInt8](length=n_reads * RSTRIDE, fill=0)
-    var h_rlen = List[Int32](length=n_reads, fill=0)
-    var name_start = List[Int](length=n_reads, fill=0)
-    var name_len = List[Int](length=n_reads, fill=0)
-    var rp = h_reads.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
-    var pos = 0
-    for r in range(n_reads):
-        pos += 1  # '@'
-        name_start[r] = pos
-        while dp[pos] != 10 and dp[pos] != 32:
-            pos += 1
-        name_len[r] = pos - name_start[r]
-        while dp[pos] != 10:
-            pos += 1
-        pos += 1
-        var L = 0
-        var slot = rp + r * RSTRIDE
-        while dp[pos] != 10:
-            if L < MAXL:
-                nt4_set(slot, L, nt4_from_ascii(dp[pos]))
-            L += 1
-            pos += 1
-        pos += 1
-        while dp[pos] != 10:  # '+'
-            pos += 1
-        pos += 1
-        pos += L  # qualities (same length as the sequence)
-        while dp[pos] != 10:
-            pos += 1
-        pos += 1
-        if L > MAXL:
-            L = 0  # too long: left unmapped
-        h_rlen[r] = Int32(L)
-    print("reads:", n_reads, "parsed in", secs(t0), "s")
-
-    var d_reads = ctx.enqueue_create_buffer[DType.uint8](n_reads * RSTRIDE)
-    var d_rlen = ctx.enqueue_create_buffer[DType.int32](n_reads)
-    var d_out = ctx.enqueue_create_buffer[DType.int32](n_reads * OUT_STRIDE)
-    var n_slots = min(batch, n_reads)
-    var d_mh = ctx.enqueue_create_buffer[DType.uint32](n_slots * MAXM)
-    var d_mp = ctx.enqueue_create_buffer[DType.uint32](n_slots * MAXM)
-    var d_ak = ctx.enqueue_create_buffer[DType.uint32](n_slots * MAXA)
-    var d_aq = ctx.enqueue_create_buffer[DType.int32](n_slots * MAXA)
-    var d_af = ctx.enqueue_create_buffer[DType.int32](n_slots * MAXA)
-    var d_ap = ctx.enqueue_create_buffer[DType.int32](n_slots * MAXA)
-    var d_ac = ctx.enqueue_create_buffer[DType.int32](n_slots * MAXA)
-    ctx.enqueue_copy(d_reads, h_reads.unsafe_ptr())
-    ctx.enqueue_copy(d_rlen, h_rlen.unsafe_ptr())
-    ctx.synchronize()
-
-    # ---- align in batches; pass 2 re-aligns with a junction table from pass 1
-    var h_out = List[Int32](length=n_reads * OUT_STRIDE, fill=0)
-    var n_junc = 0
-    var d_jd = ctx.enqueue_create_buffer[DType.uint32](1)
-    var d_jda = ctx.enqueue_create_buffer[DType.uint32](1)
-    var d_ja = ctx.enqueue_create_buffer[DType.uint32](1)
-    var d_jad = ctx.enqueue_create_buffer[DType.uint32](1)
-    for pass_ in range(n_passes):
-        if pass_ == 1:
-            ctx.enqueue_copy(h_out.unsafe_ptr(), d_out)
-            ctx.synchronize()
-            t0 = perf_counter_ns()
-            var jdb = collect_junctions(h_out, n_reads, min_support, 12)
-            n_junc = jdb.n
-            print("pass 1 junctions with >=", min_support, "supporting reads:", n_junc, "(", secs(t0), "s on host )")
-            d_jd = ctx.enqueue_create_buffer[DType.uint32](len(jdb.donor))
-            d_jda = ctx.enqueue_create_buffer[DType.uint32](len(jdb.donor))
-            d_ja = ctx.enqueue_create_buffer[DType.uint32](len(jdb.donor))
-            d_jad = ctx.enqueue_create_buffer[DType.uint32](len(jdb.donor))
-            ctx.enqueue_copy(d_jd, jdb.donor.unsafe_ptr())
-            ctx.enqueue_copy(d_jda, jdb.acc_of_donor.unsafe_ptr())
-            ctx.enqueue_copy(d_ja, jdb.acc.unsafe_ptr())
-            ctx.enqueue_copy(d_jad, jdb.donor_of_acc.unsafe_ptr())
-            ctx.synchronize()
-        t0 = perf_counter_ns()
+    def run(
+        mut self,
+        ctx: DeviceContext,
+        h_reads: List[UInt8],
+        h_rlen: List[Int32],
+        mut h_out: List[Int32],
+        n_slots: Int,
+    ) raises:
+        """Align n_slots reads already packed in h_reads / h_rlen; records land in h_out."""
+        ctx.enqueue_copy(self.d_reads, h_reads.unsafe_ptr())
+        ctx.enqueue_copy(self.d_rlen, h_rlen.unsafe_ptr())
+        ctx.synchronize()
+        var t0 = perf_counter_ns()
         var base = 0
-        while base < n_reads:
-            var cnt = min(batch, n_reads - base)
+        while base < n_slots:
+            var cnt = min(self.batch, n_slots - base)
             ctx.enqueue_function[align_kernel](
-                d_genome,
-                Int32(ref_.n_bases),
-                d_bucket,
-                d_ehash,
-                d_epos,
-                d_reads,
-                d_rlen,
-                Int32(n_reads),
+                self.d_genome,
+                Int32(self.n_bases),
+                self.d_bucket,
+                self.d_ehash,
+                self.d_epos,
+                self.d_reads,
+                self.d_rlen,
+                Int32(n_slots),
                 Int32(base),
                 Int32(cnt),
-                Int32(n_junc),
-                d_jd,
-                d_jda,
-                d_ja,
-                d_jad,
-                d_mh,
-                d_mp,
-                d_ak,
-                d_aq,
-                d_af,
-                d_ap,
-                d_ac,
-                d_out,
+                Int32(self.n_junc),
+                self.d_jd,
+                self.d_jda,
+                self.d_ja,
+                self.d_jad,
+                self.d_mh,
+                self.d_mp,
+                self.d_ak,
+                self.d_aq,
+                self.d_af,
+                self.d_ap,
+                self.d_ac,
+                self.d_out,
                 grid_dim=(cnt + BLOCK - 1) // BLOCK,
                 block_dim=BLOCK,
             )
             ctx.synchronize()
             base += cnt
-        var t_align = secs(t0)
-        print("pass", pass_ + 1, ": aligned", n_reads, "reads in", t_align, "s (", Float64(n_reads) / t_align / 1e6, "M reads/s )")
+        self.kernel_secs += secs(t0)
+        ctx.enqueue_copy(h_out.unsafe_ptr(), self.d_out)
+        ctx.synchronize()
 
-    ctx.enqueue_copy(h_out.unsafe_ptr(), d_out)
-    ctx.synchronize()
 
-    # ---- SAM
-    t0 = perf_counter_ns()
-    var op_chars = String("MIDNS")
-    var oc = op_chars.as_bytes()
-    var sam = List[UInt8](capacity=n_reads * 110 + 4096)
-    for i in range(len(ref_.names)):
-        put_str(sam, "@SQ\tSN:" + ref_.names[i] + "\tLN:" + String(ref_.lengths[i]) + "\n")
+def read_chunk(
+    mut readers: List[FastqReader],
+    paired: Bool,
+    max_t: Int,
+    mut h_reads: List[UInt8],
+    mut h_rlen: List[Int32],
+    mut names: List[UInt8],
+    mut name_off: List[Int],
+    mut name_len: List[Int],
+) raises -> Int:
+    """Parse up to max_t templates; returns how many were read."""
+    names.clear()
+    name_off.clear()
+    name_len.clear()
+    var rp = h_reads.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+    var stride = 2 if paired else 1
+    var junk = List[UInt8]()
+    var t = 0
+    while t < max_t:
+        var off = len(names)
+        var L1 = readers[0].next_read(rp + (t * stride) * RSTRIDE, names)
+        if L1 < 0:
+            break
+        name_off.append(off)
+        name_len.append(len(names) - off)
+        h_rlen[t * stride] = Int32(L1 if L1 <= MAXL else 0)
+        if paired:
+            junk.clear()
+            var L2 = readers[1].next_read(rp + (t * stride + 1) * RSTRIDE, junk)
+            if L2 < 0:
+                raise Error("mate 2 file ended before mate 1: " + String(t) + " templates")
+            h_rlen[t * stride + 1] = Int32(L2 if L2 <= MAXL else 0)
+        t += 1
+    return t
+
+
+def open_readers(path1: String, path2: String, paired: Bool) raises -> List[FastqReader]:
+    var rs = List[FastqReader]()
+    rs.append(FastqReader(path1))
+    if paired:
+        rs.append(FastqReader(path2))
+    return rs^
+
+
+def main() raises:
+    var args = argv()
+    var pos_args = List[String]()
+    var chunk = 500000
+    var jn_sample = 2000000
+    var min_support = 1
+    var max_frag = 60000
+    var i = 1
+    while i < len(args):
+        var a = String(args[i])
+        if a == "--chunk":
+            chunk = Int(String(args[i + 1]))
+            i += 2
+        elif a == "--jn-sample":
+            jn_sample = Int(String(args[i + 1]))
+            i += 2
+        elif a == "--min-support":
+            min_support = Int(String(args[i + 1]))
+            i += 2
+        elif a == "--max-frag":
+            max_frag = Int(String(args[i + 1]))
+            i += 2
+        else:
+            pos_args.append(a)
+            i += 1
+    if len(pos_args) < 3 or len(pos_args) > 4:
+        print("usage: main REF.fa OUT.sam READS_1.fastq [READS_2.fastq] [--chunk N] [--jn-sample N] [--min-support N] [--max-frag N]")
+        return
+    var paired = len(pos_args) == 4
+    var path2 = pos_args[3] if paired else String("")
+    var stride = 2 if paired else 1
+
+    var t_all = perf_counter_ns()
+    var ctx = DeviceContext()
+    print("device:", ctx.name(), "|", "paired-end" if paired else "single-end")
+
+    var t0 = perf_counter_ns()
+    var ref_ = load_fasta(pos_args[0])
+    print("reference:", len(ref_.names), "sequences,", ref_.n_bases, "bases (", secs(t0), "s )")
+    var idx = build_index(ref_)
+
+    var max_slots = chunk * stride
+    var ga = GpuAligner(ctx, ref_, idx, max_slots, 200000)
+    var h_reads = List[UInt8](length=max_slots * RSTRIDE, fill=0)
+    var h_rlen = List[Int32](length=max_slots, fill=0)
+    var h_out = List[Int32](length=max_slots * REC_STRIDE, fill=0)
+    var names = List[UInt8]()
+    var name_off = List[Int]()
+    var name_len = List[Int]()
+
+    # ---- phase A: discover junctions from the first jn_sample templates (de novo pass)
+    if jn_sample > 0:
+        t0 = perf_counter_ns()
+        var readers_a = open_readers(pos_args[2], path2, paired)
+        var counter = JunctionCounter()
+        var remaining = jn_sample
+        var seen = 0
+        while remaining > 0:
+            var n = read_chunk(readers_a, paired, min(chunk, remaining), h_reads, h_rlen, names, name_off, name_len)
+            if n == 0:
+                break
+            ga.run(ctx, h_reads, h_rlen, h_out, n * stride)
+            counter.add(h_out, n * stride, 12)
+            remaining -= n
+            seen += n
+        var db = counter.build(min_support, ref_.packed.unsafe_ptr().unsafe_mut_cast[True]().unsafe_origin_cast[MutAnyOrigin](), ref_.n_bases)
+        ga.set_junctions(ctx, db)
+        print("phase A:", seen, "templates ->", db.n, "junctions with >=", min_support, "supporting reads (", secs(t0), "s )")
+
+    # ---- phase B: stream everything, align with the junction table, resolve pairs, write SAM
+    var readers = open_readers(pos_args[2], path2, paired)
+    var of = open(pos_args[1], "w")
+    var sam = List[UInt8](capacity=chunk * 220 + 4096)
+    for c in range(len(ref_.names)):
+        put_str(sam, "@SQ\tSN:" + ref_.names[c] + "\tLN:" + String(ref_.lengths[c]) + "\n")
     put_str(sam, "@PG\tID:gpu_aligner\tPN:gpu_aligner\n")
-    var mapped = 0
-    for r in range(n_reads):
-        var rec = h_out.unsafe_ptr() + r * OUT_STRIDE
-        var ok = Int(rec[O_STATUS]) == 1
-        var chrom = 0
-        var gpos = 0
-        if ok:
-            gpos = Int(rec[O_POS])
-            chrom = ref_.chrom_of(gpos)
-            if gpos + Int(rec[O_SPAN]) > ref_.starts[chrom] + ref_.lengths[chrom]:
-                ok = False
-        for i in range(name_len[r]):
-            sam.append(dp[name_start[r] + i])
-        if not ok:
-            put_str(sam, "\t4\t*\t0\t0\t*\t*\t0\t0\t*\t*\n")
-            continue
-        mapped += 1
-        sam.append(9)
-        put_int(sam, 16 if Int(rec[O_STRAND]) == 1 else 0)
-        sam.append(9)
-        put_str(sam, ref_.names[chrom])
-        sam.append(9)
-        put_int(sam, gpos - ref_.starts[chrom] + 1)
-        sam.append(9)
-        put_int(sam, Int(rec[O_MAPQ]))
-        sam.append(9)
-        for t in range(Int(rec[O_NOPS])):
-            var v = Int(rec[OUT_OPS + t])
-            put_int(sam, v >> 3)
-            sam.append(oc[v & 7])
-        put_str(sam, "\t*\t0\t0\t*\t*\tNM:i:")
-        put_int(sam, Int(rec[O_NM]))
-        put_str(sam, "\tAS:i:")
-        put_int(sam, Int(rec[O_CHAIN]))
-        sam.append(10)
-    var of = open(String(args[3]), "w")
     of.write_bytes(sam)
-    print("mapped", mapped, "of", n_reads, "(", Float64(mapped) * 100.0 / Float64(n_reads), "% ); SAM written in", secs(t0), "s")
+    sam.clear()
+    var stats = Stats()
+    var t_parse = 0.0
+    var t_pair = 0.0
+    ga.kernel_secs = 0.0
+    var total_t = 0
+    while True:
+        t0 = perf_counter_ns()
+        var n = read_chunk(readers, paired, chunk, h_reads, h_rlen, names, name_off, name_len)
+        t_parse += secs(t0)
+        if n == 0:
+            break
+        ga.run(ctx, h_reads, h_rlen, h_out, n * stride)
+        t0 = perf_counter_ns()
+        for t in range(n):
+            write_template(sam, h_out, t, paired, max_frag, ref_, names, name_off[t], name_len[t], stats)
+        of.write_bytes(sam)
+        sam.clear()
+        t_pair += secs(t0)
+        total_t += n
+    of.close()
+
+    print("phase B: parse", t_parse, "s | GPU kernels", ga.kernel_secs, "s | pairing + SAM", t_pair, "s")
+    var n_reads = total_t * stride
+    print("GPU alignment throughput:", Float64(n_reads) / ga.kernel_secs / 1e6, "M reads/s (", total_t, "templates,", n_reads, "reads )")
+    var tt = Float64(max(stats.templates, 1))
+    if paired:
+        print("mate 1 mapped:", 100.0 * Float64(stats.mate1_mapped) / tt, "% | mate 2 mapped:", 100.0 * Float64(stats.mate2_mapped) / tt, "%")
+        print("both mapped:", 100.0 * Float64(stats.both_mapped) / tt, "% | proper pairs:", 100.0 * Float64(stats.proper) / tt, "% | one mate only:", 100.0 * Float64(stats.one_mapped) / tt, "% | neither:", 100.0 * Float64(stats.unmapped) / tt, "%")
+    else:
+        print("mapped:", 100.0 * Float64(stats.mate1_mapped) / tt, "%")
+    print("reads with a splice junction:", 100.0 * Float64(stats.spliced_mates) / Float64(max(stats.reads_total, 1)), "%")
+    print("total wall time:", secs(t_all), "s")

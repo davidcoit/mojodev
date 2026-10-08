@@ -21,7 +21,7 @@ from max.gpu.host import DeviceContext, DeviceBuffer
 
 from nt4 import PU8, nt4_bytes
 from index import Reference, MinimizerIndex, load_fasta, build_index
-from fastq import FastqReader
+from fastq import FastqReader, read_templates, build_lut, NAME_STRIDE
 from junctions import JunctionCounter, JunctionDB
 from samout import Stats, write_template, put_str
 from kernels import (
@@ -156,42 +156,6 @@ struct GpuAligner(Movable):
         ctx.synchronize()
 
 
-def read_chunk(
-    mut readers: List[FastqReader],
-    paired: Bool,
-    max_t: Int,
-    mut h_reads: List[UInt8],
-    mut h_rlen: List[Int32],
-    mut names: List[UInt8],
-    mut name_off: List[Int],
-    mut name_len: List[Int],
-) raises -> Int:
-    """Parse up to max_t templates; returns how many were read."""
-    names.clear()
-    name_off.clear()
-    name_len.clear()
-    var rp = h_reads.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
-    var stride = 2 if paired else 1
-    var junk = List[UInt8]()
-    var t = 0
-    while t < max_t:
-        var off = len(names)
-        var L1 = readers[0].next_read(rp + (t * stride) * RSTRIDE, names)
-        if L1 < 0:
-            break
-        name_off.append(off)
-        name_len.append(len(names) - off)
-        h_rlen[t * stride] = Int32(L1 if L1 <= MAXL else 0)
-        if paired:
-            junk.clear()
-            var L2 = readers[1].next_read(rp + (t * stride + 1) * RSTRIDE, junk)
-            if L2 < 0:
-                raise Error("mate 2 file ended before mate 1: " + String(t) + " templates")
-            h_rlen[t * stride + 1] = Int32(L2 if L2 <= MAXL else 0)
-        t += 1
-    return t
-
-
 def open_readers(path1: String, path2: String, paired: Bool) raises -> List[FastqReader]:
     var rs = List[FastqReader]()
     rs.append(FastqReader(path1))
@@ -246,9 +210,12 @@ def main() raises:
     var h_reads = List[UInt8](length=max_slots * RSTRIDE, fill=0)
     var h_rlen = List[Int32](length=max_slots, fill=0)
     var h_out = List[Int32](length=max_slots * REC_STRIDE, fill=0)
-    var names = List[UInt8]()
-    var name_off = List[Int]()
-    var name_len = List[Int]()
+    var lut = build_lut()
+    var names = List[UInt8](length=chunk * NAME_STRIDE, fill=0)
+    var name_off = List[Int](length=chunk, fill=0)
+    var name_len = List[Int](length=chunk, fill=0)
+    for t in range(chunk):
+        name_off[t] = t * NAME_STRIDE
 
     # ---- phase A: discover junctions from the first jn_sample templates (de novo pass)
     if jn_sample > 0:
@@ -258,7 +225,7 @@ def main() raises:
         var remaining = jn_sample
         var seen = 0
         while remaining > 0:
-            var n = read_chunk(readers_a, paired, min(chunk, remaining), h_reads, h_rlen, names, name_off, name_len)
+            var n = read_templates(readers_a, paired, min(chunk, remaining), lut, h_reads, h_rlen, names, name_len)
             if n == 0:
                 break
             ga.run(ctx, h_reads, h_rlen, h_out, n * stride)
@@ -285,7 +252,7 @@ def main() raises:
     var total_t = 0
     while True:
         t0 = perf_counter_ns()
-        var n = read_chunk(readers, paired, chunk, h_reads, h_rlen, names, name_off, name_len)
+        var n = read_templates(readers, paired, chunk, lut, h_reads, h_rlen, names, name_len)
         t_parse += secs(t0)
         if n == 0:
             break

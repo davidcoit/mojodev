@@ -41,7 +41,7 @@ no gzip; reads ≤ 256 bases). With two files the run is paired-end.
 | `src/index.mojo` | FASTA → packed genome; minimizer index as a counting-sorted bucket table (2^24 buckets) |
 | `src/kernels.mojo` | the GPU kernel: one thread per read, up to 2 candidate alignments per read |
 | `src/junctions.mojo` | junction counting across chunks, radix-sorted table for the junction-aware pass |
-| `src/fastq.mojo` | streaming FASTQ reader that packs bases straight into 4-bit slots |
+| `src/fastq.mojo` | multi-threaded FASTQ reader: concurrent ranged reads, parallel record indexing, parallel parse straight into 4-bit slots |
 | `src/samout.mojo` | pair resolution (host) and SAM writer |
 | `src/main.mojo` | driver: GPU state, phase A (junction discovery), phase B (stream, align, pair, write) |
 | `src/test_nt4.mojo` | unit tests (packing, canonical-minimizer symmetry, density, N handling) |
@@ -155,14 +155,14 @@ Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
 |---|---|
 | reference + index | ~3 s |
 | phase A, junction discovery on first 2 M pairs | 4.4-5.7 s |
-| FASTQ parse + 4-bit pack (9.5 GB of text) | 15-21 s |
-| **GPU alignment, 26.4 M reads** | **6.8-6.9 s (3.8-3.9 M reads/s)** |
-| pair resolution + SAM write (2.1 GB) | 6.7-7.2 s |
-| **total** | **38-46 s** |
+| FASTQ read + parse + 4-bit pack (9.5 GB of text), multi-threaded | 2.6-4.8 s (was 15-21 s serial) |
+| **GPU alignment, 26.4 M reads** | **6.8-8.2 s (3.2-3.9 M reads/s)**, run-to-run variation on the shared GPU |
+| pair resolution + SAM write (2.1 GB), single-threaded | 6.5-9.4 s |
+| **total** | **27-31 s** (serial reader: 38-53 s; 43.6 s in a same-session A/B) |
 
 | | GPU aligner | minimap2 2.28 `splice:sr`, 24 threads |
 |---|---|---|
-| wall time | 38-53 s | 125 s (1,790 CPU-s) |
+| wall time | 27-31 s | 125 s (1,790 CPU-s) |
 | reads mapped | 99.82% | 98.39% |
 | MAPQ >= 10 | 96.4% | 96.8% |
 | proper pairs | 98.95% | n/a (see below) |
@@ -220,9 +220,12 @@ Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
 - Residual junction noise: singleton introns are still ~21% motif-less (see above). Real
   trans-splicing (SL1/SL2 leaders) and operons also produce legitimate odd junctions in
   *C. elegans*, so some of this may be biology rather than error.
-- Host work now dominates a real run: single-threaded FASTQ parse (15-21 s of ~40 s) and
-  pairing + SAM (7 s). Overlapping parsing with GPU work, or a multi-threaded parser, would
-  cut the wall time roughly in half.
+- Host work is still ~half of a real run: single-threaded pairing + SAM writing (6.5-9.4 s)
+  and junction discovery on a leading sample (3.3 s, which re-aligns those templates). The
+  FASTQ side was the first target: one serial `read()` ran at ~0.5 GB/s and was nearly all
+  of the old 15-21 s "parse"; concurrent ranged reads (~2.2 GB/s) plus parallel indexing and
+  parsing cut it to 2.6-4.8 s. Output is byte-identical to the serial reader on all 13.2 M
+  real pairs. Reading and parsing are not overlapped with GPU work, by choice.
 - One thread per read with global-memory scratch; no shared memory or warp-cooperative
   chaining. The de novo end search (up to 10 kb) makes de novo alignment ~2.4x slower than
   the junction-aware pass.
@@ -241,3 +244,8 @@ Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
   resolution, streaming FASTQ, junction discovery on a sample), simulated pairs, and the real
   run SRR10065383. Fixed along the way: this checkout is on a nearly full `C:\` mount, so
   large data lives in `/root/aligner-data` (outside the repo).
+- **2026-10-08 (later still)**: multi-threaded FASTQ reader (`sync_parallelize` from
+  `max.algorithm`; closures need an explicit capture list, e.g. `def job(i: Int) {p}`). GPU
+  code untouched; same-session A/B against the serial reader: GPU kernel time equal (8.2 s vs
+  7.8-8.2 s), wall 43.6 s -> 26.8-31.5 s. `tools/build_head.sh REV` builds an older commit for
+  A/B output comparisons.

@@ -49,6 +49,10 @@ no gzip; reads ≤ 256 bases). With two files the run is paired-end.
 | `tools/score_sam.py` | scores a SAM against simulation truth (per mate and per pair) |
 | `tools/eval_real.py`, `tools/only_mine.py` | truth-free evaluation on real data; mate-by-mate comparison of two SAMs |
 | `tools/get_real_pe.sh` | fetch + convert the real run |
+| `tools/simulate_rnaseq.py` | multi-core paired simulator with gene truth, nascent reads and a truth SAM (oracle counts) |
+| `tools/run_compare.sh`, `repeat_timing.sh`, `timeit.py` | run every aligner arm + featureCounts variants; timings with CPU / peak RSS |
+| `tools/compare_report.py`, `compare_real.py`, `compare_core.py` | simulated-truth report, real-data report, per-fragment cross-tab |
+| `tools/get_compare_tools.sh`, `build_subread.sh`, `star_index.sh` | fetch/build STAR, featureCounts (from source), indexes |
 | `tools/bench_minimap2*.sh` | CPU baseline |
 
 ## How the aligner works
@@ -193,6 +197,17 @@ Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
   introns from 13.6% to 6.9% and removed ~9 k introns while losing 1 of 82.7 k annotated ones;
   simulated accuracy was unchanged (86.7% exact junctions, 99.78% proper pairs).
 
+## Comparison with STAR + featureCounts
+
+Full study in `docs/star_comparison_results.md` (plan: `docs/star_comparison_plan.md`; raw reports in
+`docs/results/`). On 10 M simulated pairs with gene-level truth and on the real run SRR10065383:
+alignment is 2.3-5.6x faster than STAR (3 repeats, 19-39x less CPU time); STAR annotated is more
+accurate (locus +0.5 points, exact junctions +6.6 points, gene-count error about a third lower); on real
+data gene counts agree with STAR at r = 0.998 (L1 difference 3.1%), with the differences concentrated
+in pseudogenes and paralog families. Reproduce with `tools/get_compare_tools.sh`,
+`tools/simulate_rnaseq.py`, `tools/run_compare.sh`, `tools/compare_report.py` /
+`tools/compare_real.py`, `tools/repeat_timing.sh`.
+
 ## Mojo 1.1 notes (what changed vs older docs)
 
 - GPU modules are in the **`max`** package: `from max.gpu.host import DeviceContext`,
@@ -252,3 +267,8 @@ Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
 - **2026-10-08 (later still)**: pairing + SAM formatting parallelised (48 tasks per chunk, each
   with its own output buffer and counters, concatenated in order): 6.5-9.4 s -> 2.7-4.3 s;
   real-run wall 23-24 s; output byte-identical.
+- **2026-10-08 (STAR study)**: `NH`/`HI` tags (NH=2 when another locus scores within 1 of the chosen
+  alignment); gene-truth simulator; STAR 2.7.11b + featureCounts 2.0.6 comparison on 10 M simulated
+  and 13.2 M real pairs. Found and fixed on the way: prebuilt featureCounts segfaults here (built from
+  source), the first `NH` rule (chain score ratio) over-flagged multi-mappers (7.5% -> 3.7% of
+  fragments after switching to alignment scores).

@@ -1,7 +1,9 @@
 # Plan: GPU aligner vs STAR, alignment -> featureCounts
 
-Status: **plan only, nothing below has been run.** Facts marked (measured) come from this repo's
-data; everything else is a design decision or an assumption to confirm.
+Status: **executed**; results in `star_comparison_results.md`. Decisions taken: annotated STAR as the
+primary comparator (plus de novo 2-pass), realistic simulation, counting both all-genes and
+protein-coding, simple two-candidate `NH` rule. Written before the runs; deviations: featureCounts
+was built from source, and STAR was also run with 40 kb limits.
 
 ## 1. Questions the study should answer
 

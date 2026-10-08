@@ -2,6 +2,7 @@
 # Align one paired-end dataset with every arm, then count each alignment with featureCounts.
 # Usage: tools/run_compare.sh NAME R1.fastq R2.fastq OUTDIR [ARMS]   (run from scratch/aligner)
 #   ARMS: space-separated subset of: truth gpu star_annot star_annot40k star_denovo2p   (default: all)
+#   Env: NOCOUNT=1 skips featureCounts (alignment timing only); CLEAN=1 deletes the SAM afterwards.
 #   truth = counts the simulator's perfect-alignment SAM; needs TRUTH_SAM=/path/to/prefix.truth.sam
 #
 # For every arm: <OUTDIR>/<arm>/{aligned.sam, counts_*.txt, ...} and timings appended to
@@ -58,5 +59,6 @@ for ARM in $ARMS; do
             --alignIntronMax 40000 --alignMatesGapMax 40000 --twopassMode Basic
         mv $D/star_Aligned.out.sam $D/aligned.sam ;;
     esac
-    count "$D"
+    [ -n "$NOCOUNT" ] || count "$D"
+    [ -z "$CLEAN" ] || rm -rf "$D"/aligned.sam "$D"/star__STARgenome "$D"/star__STARpass1
 done

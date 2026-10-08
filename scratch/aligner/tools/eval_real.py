@@ -48,6 +48,8 @@ def load_sam(path, want_pairs=True):
                 continue
             c = line.rstrip("\n").split("\t")
             flag = int(c[1])
+            if flag & 256 or flag & 2048:  # secondary / supplementary: evaluate primary records only
+                continue
             if not flag & 192 and not flag & 1:
                 # single-end style records (e.g. minimap2 splice:sr given two files):
                 # the first record of a name is mate 1, the second is mate 2

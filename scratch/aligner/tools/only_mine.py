@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Characterize mates mapped by SAM A but unmapped in SAM B.
 
-Usage: only_mine.py A.sam B.sam
+Usage: only_mine.py A.sam B.sam [absent]   ('absent': treat mates missing from B as unmapped, as for STAR)
 B may be single-end style (mate inferred from record order). Prints the flag, MAPQ,
 alignment-score, clipping and proper-pair profile of the A-only mates vs all A mates.
 """
@@ -28,15 +28,22 @@ def mates(path):
 
 def main():
     a_path, b_path = sys.argv[1:3]
+    absent_mode = len(sys.argv) > 3 and sys.argv[3] == "absent"   # B omits unmapped reads (STAR)
     b_unmapped = set()
+    b_mapped = set()
     for c, m, flag in mates(b_path):
+        if flag & 256 or flag & 2048:
+            continue
         if flag & 4:
             b_unmapped.add((c[0], m))
+        else:
+            b_mapped.add((c[0], m))
     prof = {"only": Counter(), "all": Counter()}
     for c, m, flag in mates(a_path):
         if flag & 4:
             continue
-        key = "only" if (c[0], m) in b_unmapped else "all"
+        missing = ((c[0], m) not in b_mapped) if absent_mode else ((c[0], m) in b_unmapped)
+        key = "only" if missing else "all"
         for k in {key, "all"}:
             p = prof[k]
             p["n"] += 1

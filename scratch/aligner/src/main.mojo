@@ -204,6 +204,7 @@ def main() raises:
                 d_rlen,
                 Int32(n_reads),
                 Int32(base),
+                Int32(cnt),
                 Int32(n_junc),
                 d_jd,
                 d_jda,

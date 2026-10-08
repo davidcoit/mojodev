@@ -276,7 +276,6 @@ def db_right(
     """Like rescue_right but only over known junctions (donor js[i] -> acceptor je[i])."""
     var best = -1
     var best_gain = 2
-    var left = 0
     for b in range(lo_b, hi_b + 1):
         var r = L - b
         if r >= MIN_DB_OVERHANG:
@@ -297,8 +296,6 @@ def db_right(
                         best_gain = gain
                         best = (b << 32) | t
                 i += 1
-        if b < hi_b:
-            left += is_match(r_get(rd, L, rev, b), g_get(g, n, b + d))
     return best
 
 
@@ -343,6 +340,7 @@ def align_kernel(
     rlen: PI32,
     n_reads: Int32,
     base: Int32,
+    count: Int32,
     n_junc: Int32,
     j_donor: PU32,
     j_acc_of_donor: PU32,
@@ -358,6 +356,8 @@ def align_kernel(
     out_buf: PI32,
 ):
     var lid = Int(global_idx.x)  # slot in this batch (scratch is per slot)
+    if lid >= Int(count):  # grid is rounded up to a block multiple: stay inside this batch
+        return
     var rid = lid + Int(base)  # global read index (reads / output are global)
     if rid >= Int(n_reads):
         return
@@ -508,29 +508,28 @@ def align_kernel(
     var nm = 0
     var ref_span = 0
     var rescued = 0
-    if True:
-        var rl = -1
-        var hi = min(qs + 8, q_first)
-        if Int(n_junc) > 0:
-            var lo_db = max(MIN_DB_OVERHANG, qs - 8)
-            if lo_db <= hi:
-                rl = db_left(genome, n, rd, L, rev, d_cur, lo_db, hi, Int(n_junc), j_acc, j_donor_of_acc)
-        if rl < 0 and qs >= 4:
-            var lo = max(MIN_RESCUE, qs - 4)
-            if lo <= hi:
-                rl = rescue_left(genome, n, rd, L, rev, d_cur, lo, hi)
-        if True:
-            if rl >= 0:
-                var bq = rl >> 32
-                var sp = rl & 0xFFFFFFFF
-                var d_left = sp - bq
-                ref_start = sp - bq
-                nm += bq - count_matches(genome, n, rd, L, rev, 0, bq, d_left)
-                n_ops = push_op(ops, n_ops, OP_M, bq)
-                n_ops = push_op(ops, n_ops, OP_N, (bq + d_cur) - sp)
-                ref_span += bq + (bq + d_cur) - sp
-                emit_q = bq
-                rescued = 1
+    # Clipped / over-extended left end: try known junctions, then a de novo
+    # canonical-intron search, to place the first exon.
+    var rl = -1
+    var hi_l = min(qs + 8, q_first)
+    if Int(n_junc) > 0:
+        var lo_db = max(MIN_DB_OVERHANG, qs - 8)
+        if lo_db <= hi_l:
+            rl = db_left(genome, n, rd, L, rev, d_cur, lo_db, hi_l, Int(n_junc), j_acc, j_donor_of_acc)
+    if rl < 0 and qs >= 4:
+        var lo_dn = max(MIN_RESCUE, qs - 4)
+        if lo_dn <= hi_l:
+            rl = rescue_left(genome, n, rd, L, rev, d_cur, lo_dn, hi_l)
+    if rl >= 0:
+        var bq = rl >> 32
+        var sp = rl & 0xFFFFFFFF
+        ref_start = sp - bq
+        nm += bq - count_matches(genome, n, rd, L, rev, 0, bq, sp - bq)
+        n_ops = push_op(ops, n_ops, OP_M, bq)
+        n_ops = push_op(ops, n_ops, OP_N, (bq + d_cur) - sp)
+        ref_span += bq + (bq + d_cur) - sp
+        emit_q = bq
+        rescued = 1
     if rescued == 0:
         n_ops = push_op(ops, n_ops, OP_S, qs)
 

@@ -50,6 +50,7 @@ struct Cand(Copyable, Movable):
     var mapq: Int
     var chain: Int
     var nm: Int
+    var ascore: Int  # alignment score: aligned bases - 3 * edits (match +1, mismatch -2)
     var off: Int  # offset of this candidate's record in the record list
 
     def __init__(out self):
@@ -61,9 +62,10 @@ struct Cand(Copyable, Movable):
         self.mapq = 0
         self.chain = 0
         self.nm = 0
+        self.ascore = 0
         self.off = 0
 
-    def __init__(out self, chrom: Int, strand: Int, gpos: Int, end: Int, mapq: Int, chain: Int, nm: Int, off: Int):
+    def __init__(out self, chrom: Int, strand: Int, gpos: Int, end: Int, mapq: Int, chain: Int, nm: Int, ascore: Int, off: Int):
         self.valid = True
         self.chrom = chrom
         self.strand = strand
@@ -72,6 +74,7 @@ struct Cand(Copyable, Movable):
         self.mapq = mapq
         self.chain = chain
         self.nm = nm
+        self.ascore = ascore
         self.off = off
 
 
@@ -122,7 +125,13 @@ def load_cand(recs: List[Int32], slot: Int, c: Int, ref_: Reference) -> Cand:
     var chrom = ref_.chrom_of(gpos)
     if gpos + span > ref_.starts[chrom] + ref_.lengths[chrom]:
         return Cand()
-    return Cand(chrom, Int(p[O_STRAND]), gpos, gpos + span, Int(p[O_MAPQ]), Int(p[O_CHAIN]), Int(p[O_NM]), off)
+    var msum = 0
+    for t in range(Int(p[O_NOPS])):
+        var v = Int(p[OUT_OPS + t])
+        if (v & 7) == 0:
+            msum += v >> 3
+    var nm = Int(p[O_NM])
+    return Cand(chrom, Int(p[O_STRAND]), gpos, gpos + span, Int(p[O_MAPQ]), Int(p[O_CHAIN]), nm, msum - 3 * nm, off)
 
 
 def compatible(a: Cand, b: Cand, max_frag: Int) -> Bool:
@@ -169,6 +178,7 @@ def put_record(
     rnext: String,
     pnext: Int,
     tlen: Int,
+    nh: Int,
 ):
     for i in range(name_len):
         sam.append(names[name_off + i])
@@ -211,6 +221,9 @@ def put_record(
         put_int(sam, c.nm)
         put_str(sam, "\tAS:i:")
         put_int(sam, c.chain)
+        put_str(sam, "\tNH:i:")
+        put_int(sam, nh)
+        put_str(sam, "\tHI:i:1")
     sam.append(10)
 
 
@@ -251,6 +264,8 @@ def write_template(
 
     var ca = a0.copy()
     var cb = b0.copy()
+    var ia = 0  # index of the chosen candidate of each mate
+    var ib = 0
     var proper = False
     var pair_mapq = 0
     if paired:
@@ -275,6 +290,8 @@ def write_template(
                 elif sc > runner:
                     runner = sc
         if best >= 0:
+            ia = bi
+            ib = bj
             ca = a0.copy() if bi == 0 else a1.copy()
             cb = b0.copy() if bj == 0 else b1.copy()
             proper = compatible(ca, cb, max_frag)
@@ -311,6 +328,19 @@ def write_template(
                 flag = 4
             elif me.strand == 1:
                 flag = 16
+        # NH: 2 when another locus has an alignment score within 1 of the chosen one (STAR's
+        # outFilterMultimapScoreRange), unless the partner resolved the ambiguity (proper
+        # pair with a confident pair MAPQ)
+        var other = Cand()
+        if m == 0:
+            other = a1.copy() if ia == 0 else a0.copy()
+        else:
+            other = b1.copy() if ib == 0 else b0.copy()
+        var nh = 1
+        if me.valid and other.valid and other.ascore >= me.ascore - 1:
+            nh = 2
+            if proper and pair_mapq >= 10:
+                nh = 1
         var mapq = me.mapq
         if proper:
             mapq = max(mapq, pair_mapq)
@@ -339,7 +369,7 @@ def write_template(
         elif me.valid and paired:
             rnext = String("=")
             pnext = pos1
-        put_record(sam, names, name_off, name_len, flag, rname, pos1, mapq, recs, me, rnext, pnext, tlen)
+        put_record(sam, names, name_off, name_len, flag, rname, pos1, mapq, recs, me, rnext, pnext, tlen, nh)
 
     if paired:
         if ca.valid:

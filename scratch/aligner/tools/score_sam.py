@@ -48,7 +48,7 @@ def main():
         for line in f:
             c = line.rstrip("\n").split("\t")
             if paired:
-                r, mate, chrom, strand, bl = c
+                r, mate, chrom, strand, bl = c[:5]
                 key = (r, int(mate))
             else:
                 r, chrom, strand, bl = c
@@ -65,6 +65,8 @@ def main():
                 continue
             c = line.rstrip("\n").split("\t")
             name, flag, chrom, pos, mapq, cigar = c[0], int(c[1]), c[2], int(c[3]), int(c[4]), c[5]
+            if flag & 256:  # secondary alignment of a multi-mapper: score the primary only
+                continue
             mate = 2 if flag & 128 else 1
             tchrom, tstrand, tblocks = truth[(name, mate)]
             kind = "spliced" if len(tblocks) > 1 else "unspliced"

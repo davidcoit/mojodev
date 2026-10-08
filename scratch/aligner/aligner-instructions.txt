@@ -1,0 +1,5 @@
+We're going to explore GPU-powered biological sequence alignment starting with nucleotide alignment. Let's start with a custom 4-bit datatype that can represent A,T,C,G, and N characters.
+Splice aware.
+You can download c elegans genome as a test reference, make a toy transcriptomic dataset to align and test the performance.
+Pseudoalignment is fine if it helps keep things in the ~10GB VRAM memory of the 3080.
+Ask any questions you need to before beginning.

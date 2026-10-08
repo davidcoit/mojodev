@@ -1,0 +1,5 @@
+data/
+results/
+build_main
+*.sam
+__pycache__/

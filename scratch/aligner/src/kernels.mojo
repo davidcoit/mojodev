@@ -32,6 +32,7 @@ comptime XDROP = 8
 comptime WIDEN = 8  # extra breakpoint slack on each side of the unseeded gap
 comptime MIN_RESCUE = 8  # shortest overhang that end-rescue will try to place
 comptime MAX_RESCUE_INTRON = 10000
+comptime MIN_DB_OVERHANG = 3  # shortest overhang placed via a known junction
 
 comptime OUT_STRIDE = 48
 comptime OUT_OPS = 16  # ops start at this slot
@@ -254,6 +255,84 @@ def rescue_left(
     return -1
 
 
+@always_inline
+def lower_bound(arr: PU32, n: Int, key: Int) -> Int:
+    """First index i with arr[i] >= key (arr sorted ascending)."""
+    var lo = 0
+    var hi = n
+    while lo < hi:
+        var mid = (lo + hi) >> 1
+        if Int(arr[mid]) < key:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def db_right(
+    g: PU8, n: Int, rd: PU8, L: Int, rev: Int, d: Int, lo_b: Int, hi_b: Int,
+    nj: Int, js: PU32, je: PU32,
+) -> Int:
+    """Like rescue_right but only over known junctions (donor js[i] -> acceptor je[i])."""
+    var best = -1
+    var best_gain = 2
+    var left = 0
+    for b in range(lo_b, hi_b + 1):
+        var r = L - b
+        if r >= MIN_DB_OVERHANG:
+            var s = b + d
+            var i = lower_bound(js, nj, s)
+            var base_r = count_matches(g, n, rd, L, rev, b, L, d)
+            while i < nj and Int(js[i]) == s:
+                var t = Int(je[i])
+                var allow = r // 10
+                var mm = 0
+                var k = 0
+                while k < r and mm <= allow:
+                    mm += 1 - is_match(r_get(rd, L, rev, b + k), g_get(g, n, t + k))
+                    k += 1
+                if mm <= allow:
+                    var gain = (r - mm) - base_r - 2 * mm
+                    if gain > best_gain:
+                        best_gain = gain
+                        best = (b << 32) | t
+                i += 1
+        if b < hi_b:
+            left += is_match(r_get(rd, L, rev, b), g_get(g, n, b + d))
+    return best
+
+
+def db_left(
+    g: PU8, n: Int, rd: PU8, L: Int, rev: Int, d: Int, lo_b: Int, hi_b: Int,
+    nj: Int, ae: PU32, a_s: PU32,
+) -> Int:
+    """Like rescue_left but only over known junctions (acceptor ae[i] <- donor a_s[i])."""
+    var best = -1
+    var best_gain = 2
+    var b = hi_b
+    while b >= lo_b:
+        if b >= MIN_DB_OVERHANG:
+            var a = b + d
+            var i = lower_bound(ae, nj, a)
+            var base_l = count_matches(g, n, rd, L, rev, 0, b, d)
+            while i < nj and Int(ae[i]) == a:
+                var sp = Int(a_s[i])
+                var allow = b // 10
+                var mm = 0
+                var k = 0
+                while k < b and mm <= allow:
+                    mm += 1 - is_match(r_get(rd, L, rev, k), g_get(g, n, sp - b + k))
+                    k += 1
+                if mm <= allow:
+                    var gain = (b - mm) - base_l - 2 * mm
+                    if gain > best_gain:
+                        best_gain = gain
+                        best = (b << 32) | sp
+                i += 1
+        b -= 1
+    return best
+
+
 def align_kernel(
     genome: PU8,
     n_genome: Int32,
@@ -264,6 +343,11 @@ def align_kernel(
     rlen: PI32,
     n_reads: Int32,
     base: Int32,
+    n_junc: Int32,
+    j_donor: PU32,
+    j_acc_of_donor: PU32,
+    j_acc: PU32,
+    j_donor_of_acc: PU32,
     m_hash: PU32,
     m_pos: PU32,
     a_key: PU32,
@@ -380,21 +464,6 @@ def align_kernel(
     if best_f < MIN_CHAIN_SCORE:
         return
 
-    # second-best chain at a distinct locus (for MAPQ)
-    var second = 0
-    var best_ref = Int(ak[best_i] & 0x7FFFFFFF)
-    var best_strand = Int(ak[best_i] >> 31)
-    for i in range(n_a):
-        var same_locus = 0
-        if Int(ak[i] >> 31) == best_strand:
-            var dist = Int(ak[i] & 0x7FFFFFFF) - best_ref
-            if dist < 0:
-                dist = -dist
-            if dist <= MAX_INTRON + MAXL:
-                same_locus = 1
-        if same_locus == 0 and Int(af[i]) > second:
-            second = Int(af[i])
-
     # backtrack, then reverse into ascending order
     var m = 0
     var cur = best_i
@@ -406,6 +475,21 @@ def align_kernel(
         var tmp = ac[t]
         ac[t] = ac[m - 1 - t]
         ac[m - 1 - t] = tmp
+
+    # second-best chain (for MAPQ): best f among anchors outside the best chain's
+    # own reference span, so tandem duplicates count as competing loci
+    var best_strand = Int(ak[best_i] >> 31)
+    var span_lo = Int(ak[Int(ac[0])] & 0x7FFFFFFF) - 2 * MM_K
+    var span_hi = Int(ak[Int(ac[m - 1])] & 0x7FFFFFFF) + 3 * MM_K
+    var second = 0
+    for i in range(n_a):
+        var inside = 0
+        if Int(ak[i] >> 31) == best_strand:
+            var ri2 = Int(ak[i] & 0x7FFFFFFF)
+            if ri2 >= span_lo and ri2 <= span_hi:
+                inside = 1
+        if inside == 0 and Int(af[i]) > second:
+            second = Int(af[i])
 
     # ---- 4/5: build the alignment from the chain
     var rev = best_strand
@@ -424,11 +508,18 @@ def align_kernel(
     var nm = 0
     var ref_span = 0
     var rescued = 0
-    if qs >= 4:
-        var lo = max(MIN_RESCUE, qs - 4)
+    if True:
+        var rl = -1
         var hi = min(qs + 8, q_first)
-        if lo <= hi:
-            var rl = rescue_left(genome, n, rd, L, rev, d_cur, lo, hi)
+        if Int(n_junc) > 0:
+            var lo_db = max(MIN_DB_OVERHANG, qs - 8)
+            if lo_db <= hi:
+                rl = db_left(genome, n, rd, L, rev, d_cur, lo_db, hi, Int(n_junc), j_acc, j_donor_of_acc)
+        if rl < 0 and qs >= 4:
+            var lo = max(MIN_RESCUE, qs - 4)
+            if lo <= hi:
+                rl = rescue_left(genome, n, rd, L, rev, d_cur, lo, hi)
+        if True:
             if rl >= 0:
                 var bq = rl >> 32
                 var sp = rl & 0xFFFFFFFF
@@ -501,11 +592,15 @@ def align_kernel(
     var re = extend_right(genome, n, rd, L, rev, cov_q, d_cur)
     var q_end = min(cov_q + re, L)
     var rr = -1
-    if L - q_end >= 4:
-        var lo = max(max(q_end - 8, cov_q - 3), emit_q + 1)
+    var lo_r = max(max(q_end - 8, cov_q - 3), emit_q + 1)
+    if Int(n_junc) > 0:
+        var hi_db = min(q_end + 4, L - MIN_DB_OVERHANG)
+        if lo_r <= hi_db:
+            rr = db_right(genome, n, rd, L, rev, d_cur, lo_r, hi_db, Int(n_junc), j_donor, j_acc_of_donor)
+    if rr < 0 and L - q_end >= 4:
         var hi = min(q_end + 4, L - MIN_RESCUE)
-        if lo <= hi:
-            rr = rescue_right(genome, n, rd, L, rev, d_cur, lo, hi)
+        if lo_r <= hi:
+            rr = rescue_right(genome, n, rd, L, rev, d_cur, lo_r, hi)
     if rr >= 0:
         var bq = rr >> 32
         var tp = rr & 0xFFFFFFFF

@@ -6,7 +6,6 @@ Layout of the index, all flat arrays so they upload straight to the GPU:
     ent_hash    32-bit minimizer hash, grouped by bucket (hash >> (32 - BUCKET_BITS))
     ent_pos     k-mer start | strand << 31
 """
-from max.gpu.host import DeviceContext, HostBuffer
 from std.time import perf_counter_ns
 
 from nt4 import PU8, PU32, nt4_from_ascii, nt4_set, nt4_bytes
@@ -21,9 +20,9 @@ struct Reference(Movable):
     var starts: List[Int]
     var lengths: List[Int]
     var n_bases: Int
-    var packed: HostBuffer[DType.uint8]
+    var packed: List[UInt8]
 
-    def __init__(out self, var names: List[String], var starts: List[Int], var lengths: List[Int], n_bases: Int, var packed: HostBuffer[DType.uint8]):
+    def __init__(out self, var names: List[String], var starts: List[Int], var lengths: List[Int], n_bases: Int, var packed: List[UInt8]):
         self.names = names^
         self.starts = starts^
         self.lengths = lengths^
@@ -45,23 +44,22 @@ struct Reference(Movable):
 
 struct MinimizerIndex(Movable):
     var n_entries: Int
-    var bucket_off: HostBuffer[DType.uint32]
-    var ent_hash: HostBuffer[DType.uint32]
-    var ent_pos: HostBuffer[DType.uint32]
+    var bucket_off: List[UInt32]
+    var ent_hash: List[UInt32]
+    var ent_pos: List[UInt32]
 
-    def __init__(out self, n_entries: Int, var bucket_off: HostBuffer[DType.uint32], var ent_hash: HostBuffer[DType.uint32], var ent_pos: HostBuffer[DType.uint32]):
+    def __init__(out self, n_entries: Int, var bucket_off: List[UInt32], var ent_hash: List[UInt32], var ent_pos: List[UInt32]):
         self.n_entries = n_entries
         self.bucket_off = bucket_off^
         self.ent_hash = ent_hash^
         self.ent_pos = ent_pos^
 
 
-def load_fasta(ctx: DeviceContext, path: String) raises -> Reference:
+def load_fasta(path: String) raises -> Reference:
     """Parse a FASTA file straight into 4-bit packed form."""
     var f = open(path, "r")
     var data = f.read_bytes()
-    var packed = ctx.enqueue_create_host_buffer[DType.uint8](nt4_bytes(len(data)) + 1)
-    ctx.synchronize()
+    var packed = List[UInt8](length=nt4_bytes(len(data)) + 1, fill=0)
     var p = packed.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
     var names = List[String]()
     var starts = List[Int]()
@@ -97,21 +95,18 @@ def load_fasta(ctx: DeviceContext, path: String) raises -> Reference:
     return Reference(names^, starts^, lengths^, n, packed^)
 
 
-def build_index(ctx: DeviceContext, ref_: Reference) raises -> MinimizerIndex:
+def build_index(ref_: Reference) raises -> MinimizerIndex:
     var t0 = perf_counter_ns()
     var cap = ref_.n_bases // 3 + 1024
-    var tmp_hash = ctx.enqueue_create_host_buffer[DType.uint32](cap)
-    var tmp_pos = ctx.enqueue_create_host_buffer[DType.uint32](cap)
-    var bucket_off = ctx.enqueue_create_host_buffer[DType.uint32](N_BUCKETS + 1)
-    ctx.synchronize()
+    var tmp_hash = List[UInt32](length=cap, fill=0)
+    var tmp_pos = List[UInt32](length=cap, fill=0)
+    var bucket_off = List[UInt32](length=N_BUCKETS + 1, fill=0)
     var th = tmp_hash.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
     var tp = tmp_pos.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
     var bo = bucket_off.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
-    for b in range(N_BUCKETS + 1):
-        bo[b] = 0
 
     var total = 0
-    var packed = ref_.packed.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+    var packed = ref_.packed.unsafe_ptr().unsafe_mut_cast[True]().unsafe_origin_cast[MutAnyOrigin]()
     for c in range(len(ref_.starts)):
         var s = ref_.starts[c]
         var e = s + ref_.lengths[c]
@@ -124,10 +119,9 @@ def build_index(ctx: DeviceContext, ref_: Reference) raises -> MinimizerIndex:
         bo[Int(th[i] >> UInt32(32 - BUCKET_BITS)) + 1] += 1
     for b in range(N_BUCKETS):
         bo[b + 1] += bo[b]
-    var ent_hash = ctx.enqueue_create_host_buffer[DType.uint32](total)
-    var ent_pos = ctx.enqueue_create_host_buffer[DType.uint32](total)
-    var cursor = ctx.enqueue_create_host_buffer[DType.uint32](N_BUCKETS)
-    ctx.synchronize()
+    var ent_hash = List[UInt32](length=total, fill=0)
+    var ent_pos = List[UInt32](length=total, fill=0)
+    var cursor = List[UInt32](length=N_BUCKETS, fill=0)
     var eh = ent_hash.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
     var ep = ent_pos.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
     var cu = cursor.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()

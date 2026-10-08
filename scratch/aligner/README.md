@@ -162,14 +162,14 @@ Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
 
 | | GPU aligner | minimap2 2.28 `splice:sr`, 24 threads |
 |---|---|---|
-| wall time | 38-46 s | 125 s (1,790 CPU-s) |
+| wall time | 38-53 s | 125 s (1,790 CPU-s) |
 | reads mapped | 99.82% | 98.39% |
 | MAPQ >= 10 | 96.4% | 96.8% |
 | proper pairs | 98.95% | n/a (see below) |
-| spliced reads | 8.10 M (30.8%) | 6.27 M (24.2%) |
-| intron observations on annotated introns | 98.70% | 99.35% |
-| distinct introns / annotated | 122.5 k / 67.5% | 95.2 k / 86.1% |
-| non-canonical motif, all distinct introns | 13.6% | 3.0% |
+| spliced reads | 8.08 M (30.7%) | 6.27 M (24.2%) |
+| intron observations on annotated introns | 98.96% | 99.35% |
+| distinct introns / annotated | 113.8 k / 72.7% | 95.2 k / 86.1% |
+| no splice motif, all distinct introns | 6.9% | 3.0% |
 | insert size (unspliced proper pairs) | median 154, IQR 127-207 | n/a |
 
 - **minimap2 cannot align spliced paired-end reads**: it errors with `--splice and --frag
@@ -182,9 +182,16 @@ Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
   flag and 87% have MAPQ >= 10, consistent with real rescues of clipped or low-quality mates
   by pairing and the junction table, though there is no truth to confirm it.
 - **There is no ground truth on real data.** The GPU aligner is more sensitive (more spliced
-  reads, more mates mapped) but noisier: 13.6% of its distinct introns lack a canonical motif
-  against 3.0% for minimap2. Those are mostly singletons (98.7% of intron observations are on
-  annotated introns), but the precision/recall trade-off is not settled.
+  reads, more mates mapped) but noisier: 6.9% of its distinct introns lack a splice motif
+  against 3.0% for minimap2. The excess is in singleton introns (20.6% motif-less at support 1,
+  vs 14.1% for minimap2); introns seen by 5+ reads are 99.3% motif-bearing (minimap2 99.8%).
+  The precision/recall trade-off is not settled.
+- **Junction precision rule**: a junction at a breakpoint with no GT..AG / GC..AG / AT..AC
+  motif (either strand) is only accepted if both flanks are >= 35 bases; otherwise the short
+  side is dropped (right tail truncated, then re-placed by the end rescue if a canonical
+  intron exists; or a short first exon clipped). On the real run this cut motif-less distinct
+  introns from 13.6% to 6.9% and removed ~9 k introns while losing 1 of 82.7 k annotated ones;
+  simulated accuracy was unchanged (86.7% exact junctions, 99.78% proper pairs).
 
 ## Mojo 1.1 notes (what changed vs older docs)
 
@@ -210,9 +217,9 @@ Wall-clock for the whole run, FASTQ in, SAM out (RTX 3080, 24-core host):
   for SEQ/QUAL. Plain FASTQ only (no gzip); `tools/get_real_pe.sh` produces plain FASTQ.
 - No mate rescue: if one mate cannot be seeded (0.30% of real pairs) it stays unmapped
   instead of being searched for near its partner. Library strandedness is not used.
-- Non-canonical intron noise: chain links across introns are not motif-checked, so some
-  low-support junctions with no GT..AG slip through. A motif or flank-length requirement at
-  breakpoint refinement is the obvious fix.
+- Residual junction noise: singleton introns are still ~21% motif-less (see above). Real
+  trans-splicing (SL1/SL2 leaders) and operons also produce legitimate odd junctions in
+  *C. elegans*, so some of this may be biology rather than error.
 - Host work now dominates a real run: single-threaded FASTQ parse (15-21 s of ~40 s) and
   pairing + SAM (7 s). Overlapping parsing with GPU work, or a multi-threaded parser, would
   cut the wall time roughly in half.

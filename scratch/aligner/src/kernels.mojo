@@ -32,6 +32,7 @@ comptime XDROP = 8
 comptime WIDEN = 8  # extra breakpoint slack on each side of the unseeded gap
 comptime MIN_RESCUE = 8  # shortest overhang that end-rescue will try to place
 comptime MAX_RESCUE_INTRON = 10000
+comptime NONCANON_FLANK = 35  # a junction without a splice motif needs this much on both sides
 comptime MIN_DB_OVERHANG = 3  # shortest overhang placed via a known junction
 
 comptime OUT_STRIDE = 48  # ints per candidate alignment record
@@ -258,6 +259,28 @@ def rescue_left(
 
 
 @always_inline
+def has_motif(g: PU8, n: Int, intron_start: Int, intron_end: Int) -> Bool:
+    """Any known splice motif, either strand: GT..AG, GC..AG, AT..AC (CT..AC, CT..GC, GT..AT reversed)."""
+    var d1 = g_get(g, n, intron_start)
+    var d2 = g_get(g, n, intron_start + 1)
+    var a1 = g_get(g, n, intron_end - 2)
+    var a2 = g_get(g, n, intron_end - 1)
+    if d1 == 2 and d2 == 3 and a1 == 0 and a2 == 2:
+        return True
+    if d1 == 1 and d2 == 3 and a1 == 0 and a2 == 1:
+        return True
+    if d1 == 2 and d2 == 1 and a1 == 0 and a2 == 2:
+        return True
+    if d1 == 1 and d2 == 3 and a1 == 2 and a2 == 1:
+        return True
+    if d1 == 0 and d2 == 3 and a1 == 0 and a2 == 1:
+        return True
+    if d1 == 2 and d2 == 3 and a1 == 0 and a2 == 3:
+        return True
+    return False
+
+
+@always_inline
 def lower_bound(arr: PU32, n: Int, key: Int) -> Int:
     """First index i with arr[i] >= key (arr sorted ascending)."""
     var lo = 0
@@ -367,6 +390,8 @@ def build_alignment(
     var nm = 0
     var ref_span = 0
     var rescued = 0
+    var seg_q = qs  # query start of the current exon
+    var n_splices = 0
     # Clipped / over-extended left end: try known junctions, then a de novo
     # canonical-intron search, to place the first exon.
     var rl = -1
@@ -388,6 +413,8 @@ def build_alignment(
         n_ops = push_op(ops, n_ops, OP_N, (bq + d_cur) - sp)
         ref_span += bq + (bq + d_cur) - sp
         emit_q = bq
+        seg_q = bq
+        n_splices = 1
         rescued = 1
     if rescued == 0:
         n_ops = push_op(ops, n_ops, OP_S, qs)
@@ -429,6 +456,27 @@ def build_alignment(
             if b < b_hi:
                 left += is_match(r_get(rd, L, rev, b), g_get(genome, n, b + d_cur))
                 right_used += is_match(r_get(rd, L, rev, b + ins), g_get(genome, n, b + ins + dt))
+        # An intron with no splice motif is only believed when both flanks are long.
+        # Otherwise drop the short side: truncate the right tail (the end rescue may
+        # still re-place it across a canonical intron) or clip a short first exon.
+        if delta >= MIN_INTRON and not has_motif(genome, n, best_b + d_cur, best_b + dt):
+            var left_flank = best_b - seg_q
+            var right_flank = L - best_b
+            if min(left_flank, right_flank) < NONCANON_FLANK:
+                if right_flank <= left_flank:
+                    break
+                if n_splices == 0:
+                    var rs0 = best_b + ins
+                    n_ops = 0
+                    nm = 0
+                    ref_span = 0
+                    n_ops = push_op(ops, n_ops, OP_S, rs0)
+                    ref_start = rs0 + dt
+                    emit_q = rs0
+                    seg_q = rs0
+                    d_cur = dt
+                    cov_q = max(rs0, qt + MM_K)
+                    continue
         # emit M up to the breakpoint, then the gap op
         nm += (best_b - emit_q) - count_matches(genome, n, rd, L, rev, emit_q, best_b, d_cur)
         n_ops = push_op(ops, n_ops, OP_M, best_b - emit_q)
@@ -443,6 +491,8 @@ def build_alignment(
         else:
             n_ops = push_op(ops, n_ops, OP_N, delta)
             ref_span += delta
+            seg_q = best_b + ins
+            n_splices += 1
         emit_q = best_b + ins
         d_cur = dt
         cov_q = max(emit_q, qt + MM_K)

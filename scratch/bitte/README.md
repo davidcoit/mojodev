@@ -274,6 +274,91 @@ The `k+l ≈ 7` crossover is arithmetic, not hardware: a GPU accelerates the
 AND-tree and the scalar walk by similar factors. GPU raises throughput; it does
 not extend the method to larger state spaces.
 
+## Real data: calcium fluorescence (`prep_spikes.py`, `tespikes.mojo`)
+
+`data/fluorescence_iNet1_Size100_CC01inh.txt` — a simulated network of 100 neurons
+with inhibition, 179,498 frames at 50 Hz (~1 hour), 122 MB of text. Not tracked
+in git; regenerate the packed form with `prep_spikes.py`.
+
+```
+../.venv-max/bin/python -I prep_spikes.py \
+    data/fluorescence_iNet1_Size100_CC01inh.txt data/spikes_z25.bits --z 2.5
+../.venv-max/bin/mojo build -O3 tespikes.mojo -o tespikes && ./tespikes data/spikes_z25.bits
+```
+
+**Detector.** A calcium indicator integrates spikes and decays slowly, so the raw
+trace is a smeared, drifting spike train and thresholding it detects "was recently
+active". The first difference removes the decay and the drift and leaves a sharp
+transient per spike. The threshold is per neuron from that neuron's own median and
+MAD (`z > 2.5`), so a noisier trace does not look busier, and only the **rising
+edge** of each run is kept so one transient gives one event. Result: 178,139 events,
+density 0.99% (0.50 Hz), per-neuron rates 0.88–1.08%. Packing round-trip is verified
+in-script. 119.8 MB of text becomes 2.19 MB of bits, 56x smaller.
+
+The packed file is byte-for-byte the layout of `BitSeq.w`, so `tespikes.mojo` reads
+it straight into buffers with no conversion (header: magic, p, n, wps; then
+`p*wps` little-endian `uint64`, signal-major, LSB-first, including BitSeq's guard
+word).
+
+**Three lags, all 9,900 ordered pairs.** The null comes free: the signal list handed
+to the estimator is `[100 originals..., 100 cyclic rotations...]`, so one all-pairs
+run over 200 signals yields both edge `i→j` and its own surrogate `(rotated i)→j`.
+A rotation kills the source's timing against the target while preserving its rate
+and autocorrelation. The largest of the 9,900 surrogate values is the floor a real
+pair must clear.
+
+| delay | frames | strongest pair | null ceiling | pairs above |
+|---|---|---|---|---|
+| short | 1 (20 ms) | **0.002308** | 0.000065 | 8,076 |
+| medium | 5 (100 ms) | 0.000070 | 0.000062 | 1 |
+| long | 25 (500 ms) | 0.000068 | 0.000075 | 0 |
+
+All the directed information sits at one frame and is gone by 100 ms, which is the
+right shape: at 20 ms per frame a monosynaptic delay is far below one frame, so a
+real influence shows at the first lag and nowhere else.
+
+**Timing** (39,800 pairs per lag, since the surrogates ride along):
+
+| stage | time |
+|---|---|
+| read + threshold 122 MB of text | 2.7 s |
+| pack to bits | 0.02 s |
+| upload 4.28 MB to GPU | 6.0 ms |
+| **all pairs, one lag, GPU** | **27.9 ms** (0.70 µs/pair) |
+| all pairs, one lag, CPU `NetTE` | 1,181 ms (29.7 µs/pair) |
+
+GPU is **42x** the optimised CPU path here — well short of the 640x the same kernel
+reaches on longer sequences. The reason is in the arithmetic: at 179,497 frames each
+thread handles only ~11 words, so launch and scheduling dominate rather than the
+ANDs. Fewer, fatter blocks would recover most of it.
+
+**What the numbers do not say.** Worth stating plainly, because the headline count is
+misleading on its own:
+
+- **8,076 of 9,900 pairs clear the null at one frame — that is not 8,076 synapses.**
+  This culture fires in network-wide bursts (0.3% of frames hold ≥10 simultaneous
+  events, one holds 98), and a burst makes every pair mutually predictive whether or
+  not they are wired together. Pairwise TE cannot separate a direct connection from
+  shared drive. The standard remedy is to condition on low-population-activity
+  frames, which this representation makes almost free: it is one more mask ANDed
+  into the root of the tree, and `count()` already starts from a root mask.
+- **It is not a firing-rate artifact.** Checked: cell 45, the most frequent source
+  among the top edges, ranks 83rd of 100 by rate. Per-neuron thresholding leaves all
+  rates within 0.88–1.08%, so rate cannot drive the asymmetry.
+- **The rising-edge rule empties two of the eight bins.** An event frame cannot be
+  followed by another event, so `y'=1, y=1` never occurs; counts for the top pair are
+  `[174574, 1360, 1627, 154, 1604, 177, 0, 0]`. Those states contribute nothing in
+  either direction, so the estimate rests on the frames where the target was quiet.
+  A detector choice, not biology.
+- The mechanism behind the top edge, in one line: when cell 45 fires and cell 77 was
+  not already firing, cell 77 fires next 177/1537 = **11.5%** of the time, against a
+  baseline of **1.00%**. An 11-fold change in the odds, carried by 177 events out of
+  179,496 frames — which is why it is only 0.0023 bits.
+
+An illustrated walkthrough of the whole calculation, with the real bit-planes and an
+interactive AND/popcount, is published at
+<https://claude.ai/artifact/H5dLUnj3ow5bfgmieVznGi> (source: `intro.html`).
+
 ## Honest limits
 
 - Only useful for small `k+l`. That happens to be the regime binary TE is

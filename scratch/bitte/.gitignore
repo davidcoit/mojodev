@@ -4,3 +4,9 @@ validate
 netvalidate
 smoke
 gpurun
+tespikes
+
+# Source fluorescence (122 MB) and the packed spikes derived from it.
+# Regenerate the .bits with prep_spikes.py.
+data/*.txt
+data/*.bits

@@ -1,0 +1,695 @@
+<title>Spikes to Bits</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;700;900&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+/* Layout: one 62ch reading column; figures break out to a wider panel band. */
+:root {
+  --paper: #f7f8f7;
+  --panel: #ffffff;
+  --ink: #15201b;
+  --ink-soft: #5c6b63;
+  --rule: #d8ded9;
+  --spike: #10794f;      /* GCaMP green: a 1 bit, a fluorescence event */
+  --counted: #9a4a09;    /* a column the mask selected */
+  --zero: #e6eae7;
+  --font-display: "Chivo", "Helvetica Neue", Arial, sans-serif;
+  --font-body: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  --cell: 15px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0f1512;
+    --panel: #161d19;
+    --ink: #e4ebe6;
+    --ink-soft: #94a39b;
+    --rule: #2c3631;
+    --spike: #3fd292;
+    --counted: #f2a65a;
+    --zero: #222b26;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0f1512;
+  --panel: #161d19;
+  --ink: #e4ebe6;
+  --ink-soft: #94a39b;
+  --rule: #2c3631;
+  --spike: #3fd292;
+  --counted: #f2a65a;
+  --zero: #222b26;
+  color-scheme: dark;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 1.0625rem;
+  line-height: 1.65;
+}
+.wrap {
+  max-width: 54rem;
+  margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 3rem 5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 2.75rem;
+}
+.measure { max-width: 62ch; min-width: 0; }
+
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(2.1rem, 6vw, 3.3rem); font-weight: 900; line-height: 1.04; letter-spacing: -0.02em; }
+h2 { font-size: clamp(1.3rem, 3.4vw, 1.7rem); font-weight: 700; letter-spacing: -0.01em; }
+h3 { font-size: 1rem; font-weight: 700; }
+p { margin: 0; }
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-soft);
+}
+.lede { font-size: 1.2rem; color: var(--ink); }
+.sub { color: var(--ink-soft); }
+section { display: flex; flex-direction: column; gap: 1.1rem; }
+code, .mono { font-family: var(--font-mono); font-size: 0.9em; }
+code { background: var(--zero); padding: 0.1em 0.35em; border-radius: 3px; }
+em.term { font-style: normal; color: var(--spike); font-weight: 600; }
+
+/* --- header strip of the real run's figures --- */
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+  gap: 1px;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.fact { background: var(--panel); padding: 0.8rem 0.9rem; min-width: 0; }
+.fact b {
+  display: block;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.35rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+.fact span {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-soft);
+}
+
+/* --- figures --- */
+figure {
+  margin: 0;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  padding: 1.15rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  min-width: 0;
+}
+figcaption { font-size: 0.9rem; color: var(--ink-soft); }
+figcaption b { color: var(--ink); font-weight: 600; }
+.scroller { overflow-x: auto; min-width: 0; }
+svg { display: block; max-width: 100%; height: auto; }
+
+/* --- bit rows --- */
+.bitrow { display: grid; grid-template-columns: repeat(64, var(--cell)); gap: 1px; }
+.bit {
+  width: var(--cell);
+  height: var(--cell);
+  background: var(--zero);
+  border-radius: 1px;
+}
+.bit.on { background: var(--spike); }
+.bit.hit { background: var(--counted); }
+.bitlabel {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--ink-soft);
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: baseline;
+}
+.bitlabel b { color: var(--ink); font-weight: 600; }
+.plane { display: flex; flex-direction: column; gap: 0.28rem; min-width: max-content; }
+.planes { display: flex; flex-direction: column; gap: 0.75rem; min-width: max-content; }
+.ruler {
+  display: grid;
+  grid-template-columns: repeat(64, var(--cell));
+  gap: 1px;
+  font-family: var(--font-mono);
+  font-size: 0.56rem;
+  color: var(--ink-soft);
+}
+.ruler span { width: var(--cell); text-align: center; }
+.andline { border-top: 1px solid var(--rule); padding-top: 0.6rem; }
+
+/* --- toggles --- */
+.controls { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.toggle {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+}
+.toggle[aria-pressed="true"] { border-color: var(--spike); color: var(--spike); font-weight: 600; }
+.toggle:focus-visible { outline: 2px solid var(--spike); outline-offset: 2px; }
+.readout {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.4rem;
+}
+.readout b { color: var(--counted); font-variant-numeric: tabular-nums; }
+
+/* --- tables --- */
+table { border-collapse: collapse; font-size: 0.9rem; width: 100%; }
+caption { text-align: left; font-size: 0.9rem; color: var(--ink-soft); padding-bottom: 0.5rem; }
+th, td { text-align: right; padding: 0.42rem 0.7rem; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+thead th {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+td { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+td.name { font-family: var(--font-body); }
+tr.strong td { color: var(--spike); font-weight: 600; }
+tr.dim td { color: var(--ink-soft); }
+
+.bins { display: grid; grid-template-columns: repeat(auto-fit, minmax(5.4rem, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 4px; overflow: hidden; }
+.binc { background: var(--panel); padding: 0.55rem 0.6rem; min-width: 0; }
+.binc .st { font-family: var(--font-mono); font-size: 0.68rem; color: var(--ink-soft); letter-spacing: 0.04em; }
+.binc .ct { font-family: var(--font-mono); font-size: 1rem; font-variant-numeric: tabular-nums; }
+.binc.zero .ct { color: var(--ink-soft); }
+.binc.key { background: color-mix(in srgb, var(--counted) 14%, var(--panel)); }
+.binc.key .ct { color: var(--counted); font-weight: 600; }
+
+ul { margin: 0; padding-left: 1.2rem; display: flex; flex-direction: column; gap: 0.5rem; }
+li { padding-left: 0.2rem; }
+.formula {
+  font-family: var(--font-mono);
+  font-size: 0.86rem;
+  line-height: 1.9;
+  background: var(--zero);
+  border-radius: 4px;
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+}
+hr { border: 0; border-top: 1px solid var(--rule); margin: 0; }
+.footnote { font-size: 0.85rem; color: var(--ink-soft); }
+@media (max-width: 640px) { :root { --cell: 11px; } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+  <header class="measure" style="display:flex;flex-direction:column;gap:1rem">
+    <p class="eyebrow">Transfer entropy, computed with bitwise operations</p>
+    <h1>Spikes to Bits</h1>
+    <p class="lede">One hour of simulated calcium fluorescence from 100 neurons, turned into
+    100 bit strings, and asked a single question 9,900 times over: does knowing what
+    neuron <em class="term">x</em> just did help predict what neuron <em class="term">y</em>
+    does next, beyond what <em class="term">y</em>'s own past already tells us?</p>
+  </header>
+
+  <div class="facts">
+    <div class="fact"><b>179,498</b><span>frames &times; 100 cells</span></div>
+    <div class="fact"><b>178,139</b><span>spikes detected</span></div>
+    <div class="fact"><b>2.19 MB</b><span>packed, from 122 MB</span></div>
+    <div class="fact"><b>9,900</b><span>ordered pairs</span></div>
+    <div class="fact"><b>27.9 ms</b><span>all pairs, on GPU</span></div>
+  </div>
+
+  <section class="measure">
+    <h2>What the number means</h2>
+    <p>Transfer entropy measures how much of the uncertainty about a target's next
+    value is removed by the source's recent past, <i>after</i> the target's own
+    recent past has already been accounted for. That last clause is what separates it
+    from correlation. A neuron whose firing is highly predictable from its own history
+    scores zero, however regular it looks; only genuinely new information counts.</p>
+    <p>For binary data the whole calculation collapses to counting. With one step of
+    target history and one of source history there are exactly eight possible joint
+    states of (<span class="mono">y&prime;</span>, <span class="mono">y</span>,
+    <span class="mono">x</span>) &mdash; the target's next bit, its current bit, and the
+    source's bit. Count how often each of the eight occurs and the entropy follows.
+    Everything below is about counting those eight numbers quickly.</p>
+  </section>
+
+  <section>
+    <div class="measure">
+      <h2>From fluorescence to one bit per frame</h2>
+      <p>A calcium indicator does not report spikes. It integrates them and then decays
+      slowly, so the raw trace is a smeared, drifting version of the spike train;
+      thresholding it directly mostly detects <i>was recently active</i>. Taking the
+      first difference along time removes the decay and the drift and leaves a sharp
+      positive transient at each spike. That is what gets thresholded.</p>
+    </div>
+    <figure>
+      <div class="scroller"><svg id="pipe" viewBox="0 0 780 330" role="img"
+        aria-label="A calcium trace, its first difference with a threshold line, and the resulting spike bits."></svg></div>
+      <figcaption id="pipecap"></figcaption>
+    </figure>
+    <div class="measure">
+      <p>The threshold is set per neuron from the median and the median absolute
+      deviation of that neuron's own derivative, so a noisier trace does not simply look
+      busier. Only the <b>rising edge</b> of each run above threshold is kept, so one
+      transient yields one event rather than three adjacent ones. Across all 100 cells
+      this gives 178,139 events, a density of 0.99% &mdash; about 0.50&nbsp;Hz at the
+      50&nbsp;Hz frame rate.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="measure">
+      <h2>Three planes, read from two strings</h2>
+      <p>Here is the step that makes the rest cheap. Pack each spike train one bit per
+      frame, 64 frames to a 64-bit word. The three quantities the estimator needs are
+      then not three arrays but three <b>reads of the same packed memory at different
+      bit offsets</b>: the target's next bit, the target's current bit, and the source's
+      bit. A plane is a shift, not a copy.</p>
+      <p>The rows below are real: word 1,964 of this recording, frames 125,696 to
+      125,759, roughly 42 minutes in. Note what the hex says &mdash; the future plane is
+      the history plane shifted by exactly one bit.</p>
+    </div>
+    <figure>
+      <div class="scroller">
+        <div class="planes">
+          <div class="plane">
+            <div class="bitlabel"><span><b>y&prime;</b> &nbsp;target at frame n+1</span><span class="mono">0000008040108000</span></div>
+            <div class="bitrow" id="row-f"></div>
+          </div>
+          <div class="plane">
+            <div class="bitlabel"><span><b>y</b> &nbsp;target at frame n</span><span class="mono">0000010080210000</span></div>
+            <div class="bitrow" id="row-h"></div>
+          </div>
+          <div class="plane">
+            <div class="bitlabel"><span><b>x</b> &nbsp;source at frame n (cell 45)</span><span class="mono">0000000040000000</span></div>
+            <div class="bitrow" id="row-g"></div>
+          </div>
+          <div class="ruler" id="ruler"></div>
+        </div>
+      </div>
+      <figcaption>Target cell 77, source cell 45 &mdash; the strongest pair in the whole
+      run. Four target events and one source event fall inside these 64 frames.
+      <b>0000010080210000 &gt;&gt; 1 = 0000008040108000</b>, which is the entire
+      relationship between the first two rows.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <div class="measure">
+      <h2>One AND, one popcount, 64 frames at a time</h2>
+      <p>To count how often a particular joint state occurs, take the plane for each of
+      the three bits, complement the ones that should be zero, AND them together, and
+      count the set bits. A single 64-bit AND tests 64 frames at once, and the
+      population count is one instruction. The complement is free in the same sense:
+      <code>mask &amp; ~P</code> equals <code>mask ^ (mask &amp; P)</code>, so once the
+      one-branch is computed the zero-branch costs an XOR and no counting at all, since
+      its total is the parent's total minus the one-branch's.</p>
+      <p>Choose a state and watch which frames survive.</p>
+    </div>
+    <figure>
+      <div class="controls">
+        <button class="toggle" id="t-f" aria-pressed="true" type="button">y&prime; = 1</button>
+        <button class="toggle" id="t-h" aria-pressed="false" type="button">y = 0</button>
+        <button class="toggle" id="t-g" aria-pressed="true" type="button">x = 1</button>
+        <span class="sub" style="font-size:0.82rem">click to flip</span>
+      </div>
+      <div class="scroller">
+        <div class="planes">
+          <div class="plane">
+            <div class="bitlabel"><span id="lab-f"></span><span class="mono" id="hex-f"></span></div>
+            <div class="bitrow" id="m-f"></div>
+          </div>
+          <div class="plane">
+            <div class="bitlabel"><span id="lab-h"></span><span class="mono" id="hex-h"></span></div>
+            <div class="bitrow" id="m-h"></div>
+          </div>
+          <div class="plane">
+            <div class="bitlabel"><span id="lab-g"></span><span class="mono" id="hex-g"></span></div>
+            <div class="bitrow" id="m-g"></div>
+          </div>
+          <div class="plane andline">
+            <div class="bitlabel"><span><b>AND</b> &nbsp;frames in this state</span><span class="mono" id="hex-m"></span></div>
+            <div class="bitrow" id="m-and"></div>
+          </div>
+        </div>
+      </div>
+      <div class="readout">
+        <span>popcount in this word: <b id="pc">0</b></span>
+        <span>bin: <b id="binid">5</b></span>
+        <span>count over all 179,496 frames: <b id="bintot">177</b></span>
+      </div>
+      <figcaption id="andcap"></figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <div class="measure">
+      <h2>Eight numbers, then one</h2>
+      <p>Run that over the whole recording and the pair is summarised by eight counts.
+      These are the real ones for cell 45 driving cell 77:</p>
+    </div>
+    <div class="bins" id="bins"></div>
+    <div class="measure">
+      <p>The signal lives in one of them. When cell 45 fires and cell 77 was not already
+      firing, cell 77 fires on the next frame 177 times out of 1,537, which is
+      <b>11.5%</b>. Without knowing anything about cell 45, cell 77's chance of firing on
+      any given frame is <b>1.00%</b>. An eleven-fold change in the odds, carried by
+      177 events out of 179,496 frames.</p>
+      <p>Transfer entropy weighs that against how often it happens, which is why a large
+      odds ratio on rare events yields a small number of bits:</p>
+      <div class="formula">TE = &Sigma; p(y&prime;,&thinsp;y,&thinsp;x) &middot;
+        log<sub>2</sub> [ p(y&prime; | y,&thinsp;x) &divide; p(y&prime; | y) ]
+        &nbsp;=&nbsp; <b>0.00231 bits</b> per frame</div>
+      <p>Two of the eight bins are empty, and that is the detector's doing rather than
+      the biology's. Keeping only rising edges means a frame marked as an event cannot
+      be followed by another event, so <span class="mono">y&prime;=1</span> with
+      <span class="mono">y=1</span> never occurs. Those states contribute nothing in
+      either direction, so the estimate rests entirely on the frames where the target
+      was quiet.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="measure">
+      <h2>Short, medium and long delay</h2>
+      <p>The source bit does not have to come from the immediately preceding frame. The
+      lag is an argument, and since a plane is just a read offset, changing it costs
+      nothing: the same packed data is read a few bits further along. Three delays were
+      run over all 9,900 pairs.</p>
+    </div>
+    <figure>
+      <div class="scroller">
+        <table>
+          <caption>Each run also carries its own null: every source is duplicated as a
+          cyclic rotation of itself, which destroys its timing against the target while
+          keeping its rate and autocorrelation. The largest of those 9,900 surrogate
+          values is the floor a real pair has to clear.</caption>
+          <thead><tr>
+            <th>Delay</th><th>Frames</th><th>Strongest pair</th>
+            <th>Null ceiling</th><th>Pairs above it</th>
+          </tr></thead>
+          <tbody>
+            <tr class="strong"><td class="name">Short</td><td>1 &nbsp;(20 ms)</td><td>0.002308</td><td>0.000065</td><td>8,076</td></tr>
+            <tr><td class="name">Medium</td><td>5 &nbsp;(100 ms)</td><td>0.000070</td><td>0.000062</td><td>1</td></tr>
+            <tr class="dim"><td class="name">Long</td><td>25 &nbsp;(500 ms)</td><td>0.000068</td><td>0.000075</td><td>0</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <figcaption>All of the directed information sits at one frame. By 100&nbsp;ms the
+      strongest pair in the network barely clears its own surrogate, and by 500&nbsp;ms
+      nothing does. The null ceiling stays near 0.00007 bits at every delay, which is
+      the estimator's bias floor on data of this length and sparsity.</figcaption>
+    </figure>
+    <div class="measure">
+      <p>That collapse is the expected shape. At 20&nbsp;ms per frame a monosynaptic
+      delay is far shorter than one frame, so a real influence appears at the first lag
+      and nowhere else. A lag profile that peaked at 100 or 500&nbsp;ms would more likely
+      indicate slow shared drive than a connection.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="measure">
+      <h2>What it cost</h2>
+      <p>The run covered 39,800 ordered pairs, because the 100 rotation surrogates are
+      estimated alongside the 100 real signals in the same pass.</p>
+    </div>
+    <figure>
+      <div class="scroller">
+        <table>
+          <thead><tr><th>Stage</th><th>Time</th><th>Rate</th></tr></thead>
+          <tbody>
+            <tr><td class="name">Read and threshold 122 MB of text</td><td>2.7 s</td><td>once</td></tr>
+            <tr><td class="name">Pack to bits</td><td>0.02 s</td><td>2.19 MB out</td></tr>
+            <tr><td class="name">Upload 4.28 MB to the GPU</td><td>6.0 ms</td><td>once for all delays</td></tr>
+            <tr class="strong"><td class="name">All pairs, one delay, GPU</td><td>27.9 ms</td><td>0.70 &micro;s per pair</td></tr>
+            <tr><td class="name">All pairs, one delay, CPU</td><td>1,181 ms</td><td>29.7 &micro;s per pair</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <figcaption>The GPU runs 42&times; faster than the optimised single-threaded CPU
+      path here. That is well short of the 640&times; the same kernel reaches on longer
+      sequences, and the reason is visible in the arithmetic: at 179,497 frames each
+      thread handles only about 11 words, so launch and scheduling dominate rather than
+      the ANDs. Fewer, fatter blocks would recover most of the gap.</figcaption>
+    </figure>
+  </section>
+
+  <section class="measure">
+    <h2>What these numbers do not say</h2>
+    <ul>
+      <li><b>8,076 pairs out of 9,900 clear the null at one frame.</b> That is not 8,076
+      synapses. This kind of culture fires in network-wide bursts &mdash; 0.3% of frames
+      here contain ten or more simultaneous events, and one contains 98 &mdash; and a
+      burst makes every pair mutually predictive whether or not they are wired together.
+      Pairwise transfer entropy cannot separate a direct connection from shared drive.
+      The standard remedy is to condition on frames of low population activity, which
+      the bit representation makes cheap: it is one more mask ANDed into the root.</li>
+      <li><b>The strongest edges are not simply the busiest cells.</b> Worth checking,
+      and it does not hold: cell 45, the most frequent source among the top edges, ranks
+      83rd of 100 by firing rate. Per-neuron thresholding leaves all 100 rates between
+      0.88% and 1.08%, so rate cannot drive the asymmetry.</li>
+      <li><b>0.0023 bits is small in absolute terms</b> even at 35&times; the null
+      ceiling. It is an average over every frame, and the informative frames are the 1%
+      where something happened.</li>
+      <li><b>One step of history each.</b> Both the target and the source get a single
+      frame of past. Longer histories are supported, and the method stays faster than a
+      scalar count up to about seven total history bits, past which the state space
+      outgrows the 64-fold packing and a plain per-sample histogram wins.</li>
+    </ul>
+    <hr>
+    <p class="footnote">Data: <span class="mono">fluorescence_iNet1_Size100_CC01inh</span>,
+    a simulated network of 100 neurons with inhibition, 179,498 frames at 50&nbsp;Hz.
+    Detector, estimator and GPU kernel are written in Mojo, except for the text parsing
+    and thresholding, which are NumPy. Timings are from an RTX 3080 under WSL2, best of
+    three.</p>
+  </section>
+
+</div>
+
+<script>
+const FIG = {"neuron": 77, "source": 45, "word_index": 1964, "start_frame": 125656, "trace": [0.124, -0.002, 0.053, -0.051, 0.042, -0.013, 0.045, -0.004, 0.068, 0.009, -0.027, 0.02, 0.067, 0.018, -0.003, -0.011, 0.015, 0.081, 0.523, 0.626, 0.629, 0.623, 0.581, 0.604, 0.626, 0.525, 0.671, 0.599, 0.545, 0.553, 0.562, 0.555, 0.54, 0.505, 0.579, 0.517, 0.528, 0.584, 0.514, 0.478, 0.464, 0.487, 0.417, 0.465, 0.44, 0.441, 0.436, 0.472, 0.435, 0.429, 0.412, 0.447, 0.432, 0.421, 0.439, 0.396, 0.342, 0.452, 0.334, 0.364, 0.364, 0.301, 0.438, 0.354, 0.357, 0.352, 0.393, 0.371, 0.321, 0.357, 0.365, 0.428, 0.724, 0.675, 0.651, 0.672, 0.676, 0.641, 0.702, 0.624, 0.577, 0.695, 0.643, 0.639, 0.55, 0.642, 0.594, 0.591, 0.581, 0.539, 0.534, 0.533, 0.528, 0.532, 0.584, 0.543, 0.54, 0.509, 0.484, 0.546, 0.508, 0.494, 0.517, 0.495, 0.491, 0.415, 0.472, 0.44, 0.496, 0.429, 0.442, 0.401, 0.429, 0.449, 0.367, 0.464, 0.426, 0.42, 0.412, 0.431, 0.394, 0.403, 0.394, 0.401, 0.394, 0.322, 0.295, 0.368, 0.321, 0.328, 0.376, 0.395, 0.363, 0.306, 0.326, 0.306, 0.293, 0.322, 0.346, 0.284, 0.333, 0.313, 0.264, 0.29, 0.301, 0.285, 0.297, 0.241, 0.3, 0.279, 0.232, 0.265, 0.213, 0.251, 0.254, 0.234, 0.252, 0.194, 0.204, 0.197, 0.206, 0.225, 0.205, 0.199, 0.214, 0.154, 0.202, 0.179, 0.216, 0.188, 0.188, 0.162, 0.18, 0.169, 0.173, 0.215, 0.12, 0.135, 0.153, 0.125, 0.151, 0.164, 0.201, 0.149, 0.183, 0.135, 0.092, 0.096, 0.134, 0.297, 0.309, 0.268, 0.307, 0.238, 0.359, 0.324, 0.37, 0.308, 0.351, 0.307], "diff": [-0.126, 0.055, -0.104, 0.093, -0.055, 0.058, -0.049, 0.072, -0.059, -0.036, 0.047, 0.047, -0.049, -0.021, -0.008, 0.026, 0.066, 0.442, 0.103, 0.003, -0.006, -0.042, 0.023, 0.022, -0.101, 0.146, -0.072, -0.054, 0.008, 0.009, -0.007, -0.015, -0.035, 0.074, -0.062, 0.011, 0.056, -0.07, -0.036, -0.014, 0.023, -0.07, 0.048, -0.025, 0.001, -0.005, 0.036, -0.037, -0.006, -0.017, 0.035, -0.015, -0.011, 0.018, -0.043, -0.054, 0.11, -0.118, 0.03, 0.0, -0.063, 0.137, -0.084, 0.003, -0.005, 0.041, -0.022, -0.05, 0.036, 0.008, 0.063, 0.296, -0.049, -0.024, 0.021, 0.004, -0.035, 0.061, -0.078, -0.047, 0.118, -0.052, -0.004, -0.089, 0.092, -0.048, -0.003, -0.01, -0.042, -0.005, -0.001, -0.005, 0.004, 0.052, -0.041, -0.003, -0.031, -0.025, 0.062, -0.038, -0.014, 0.023, -0.022, -0.004, -0.076, 0.057, -0.032, 0.056, -0.067, 0.013, -0.041, 0.028, 0.02, -0.082, 0.097, -0.038, -0.006, -0.008, 0.019, -0.037, 0.009, -0.009, 0.007, -0.007, -0.072, -0.027, 0.073, -0.047, 0.007, 0.048, 0.019, -0.032, -0.057, 0.02, -0.02, -0.013, 0.029, 0.024, -0.062, 0.049, -0.02, -0.049, 0.026, 0.011, -0.016, 0.012, -0.056, 0.059, -0.021, -0.047, 0.033, -0.052, 0.038, 0.003, -0.02, 0.018, -0.058, 0.01, -0.007, 0.009, 0.019, -0.02, -0.006, 0.015, -0.06, 0.048, -0.023, 0.037, -0.028, 0.0, -0.026, 0.018, -0.011, 0.004, 0.042, -0.095, 0.015, 0.018, -0.028, 0.026, 0.013, 0.037, -0.052, 0.034, -0.048, -0.043, 0.004, 0.038, 0.163, 0.012, -0.041, 0.039, -0.069, 0.121, -0.035, 0.046, -0.062, 0.043, -0.044], "threshold": 0.10649, "sigma": 0.043, "win_spikes": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0], "future": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "hist": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "source_bits": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "words": {"future": "0000008040108000", "hist": "0000010080210000", "source": "0000000040000000"}, "rates": {"median": 0.00999, "n45": 0.00942, "n77": 0.00992}};
+
+/* ---------- bit rows ---------- */
+function fillRow(el, bits, hitBits) {
+  el.textContent = "";
+  for (let i = 0; i < 64; i++) {
+    const d = document.createElement("div");
+    d.className = "bit" + (hitBits && hitBits[i] ? " hit" : (bits[i] ? " on" : ""));
+    el.appendChild(d);
+  }
+}
+fillRow(document.getElementById("row-f"), FIG.future);
+fillRow(document.getElementById("row-h"), FIG.hist);
+fillRow(document.getElementById("row-g"), FIG.source_bits);
+
+const ruler = document.getElementById("ruler");
+for (let i = 0; i < 64; i++) {
+  const s = document.createElement("span");
+  s.textContent = (i % 8 === 0) ? String(i) : "";
+  ruler.appendChild(s);
+}
+
+/* ---------- interactive AND ---------- */
+const REAL_COUNTS = [174574, 1360, 1627, 154, 1604, 177, 0, 0];
+const st = { f: 1, h: 0, g: 1 };
+const planes = { f: FIG.future, h: FIG.hist, g: FIG.source_bits };
+const names = { f: "y&prime;", h: "y", g: "x" };
+const descr = {
+  f: "target at frame n+1",
+  h: "target at frame n",
+  g: "source at frame n"
+};
+
+function hex64(bits) {
+  let out = "";
+  for (let byte = 7; byte >= 0; byte--) {
+    let v = 0;
+    for (let b = 7; b >= 0; b--) {
+      v = (v << 1) | (bits[byte * 8 + b] ? 1 : 0);
+    }
+    out += v.toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
+}
+
+function render() {
+  const sel = {};
+  for (const k of ["f", "h", "g"]) {
+    sel[k] = planes[k].map(b => (st[k] ? b : 1 - b));
+    document.getElementById("lab-" + k).innerHTML =
+      "<b>" + names[k] + " = " + st[k] + "</b> &nbsp;" +
+      (st[k] ? "" : "complement of ") + descr[k];
+    document.getElementById("hex-" + k).textContent = hex64(sel[k]);
+    document.getElementById("t-" + k).innerHTML = names[k] + " = " + st[k];
+    document.getElementById("t-" + k).setAttribute("aria-pressed", st[k] ? "true" : "false");
+  }
+  const and = [];
+  for (let i = 0; i < 64; i++) and.push(sel.f[i] & sel.h[i] & sel.g[i]);
+
+  fillRow(document.getElementById("m-f"), sel.f);
+  fillRow(document.getElementById("m-h"), sel.h);
+  fillRow(document.getElementById("m-g"), sel.g);
+  fillRow(document.getElementById("m-and"), and, and);
+  document.getElementById("hex-m").textContent = hex64(and);
+
+  const pc = and.reduce((a, b) => a + b, 0);
+  const bin = (st.f << 2) | (st.h << 1) | st.g;
+  document.getElementById("pc").textContent = pc;
+  document.getElementById("binid").textContent = bin;
+  document.getElementById("bintot").textContent = REAL_COUNTS[bin].toLocaleString();
+
+  const where = [];
+  for (let i = 0; i < 64; i++) if (and[i]) where.push(i);
+  let cap;
+  if (bin === 5) {
+    cap = "This is the state that carries the signal: the source fired, the target " +
+      "had not just fired, and the target fired on the next frame. It happens once " +
+      "in this word, at offset " + where[0] + " — frame " +
+      (FIG.word_index * 64 + where[0]).toLocaleString() + " of the recording.";
+  } else if (pc === 0) {
+    cap = "No frame in this word is in this state. Over the full recording it occurs " +
+      REAL_COUNTS[bin].toLocaleString() + " times" +
+      (REAL_COUNTS[bin] === 0
+        ? ", which is the rising-edge rule at work: an event frame cannot be followed by another."
+        : ".");
+  } else {
+    cap = "Set at " + (where.length === 1 ? "offset " : "offsets ") + where.join(", ") +
+      " of this word. Over the full recording this state occurs " +
+      REAL_COUNTS[bin].toLocaleString() + " times.";
+  }
+  document.getElementById("andcap").textContent = cap;
+}
+
+for (const k of ["f", "h", "g"]) {
+  document.getElementById("t-" + k).addEventListener("click", () => {
+    st[k] = st[k] ? 0 : 1;
+    render();
+  });
+}
+render();
+
+/* ---------- the eight bins ---------- */
+const binsEl = document.getElementById("bins");
+for (let s = 0; s < 8; s++) {
+  const f = (s >> 2) & 1, h = (s >> 1) & 1, g = s & 1;
+  const d = document.createElement("div");
+  d.className = "binc" + (REAL_COUNTS[s] === 0 ? " zero" : "") + (s === 5 ? " key" : "");
+  d.innerHTML = '<div class="st">y′' + f + " y" + h + " x" + g + '</div>' +
+    '<div class="ct">' + REAL_COUNTS[s].toLocaleString() + "</div>";
+  binsEl.appendChild(d);
+}
+
+/* ---------- pipeline figure ---------- */
+(function () {
+  const svg = document.getElementById("pipe");
+  const NS = "http://www.w3.org/2000/svg";
+  const W = 780, L = 46, R = 12;
+  const iw = W - L - R;
+  const tr = FIG.trace, df = FIG.diff, sp = FIG.win_spikes;
+  const n = tr.length;
+  const x = i => L + (i / (n - 1)) * iw;
+
+  const css = getComputedStyle(document.body);
+  const ink = css.getPropertyValue("--ink").trim();
+  const soft = css.getPropertyValue("--ink-soft").trim();
+  const rule = css.getPropertyValue("--rule").trim();
+  const spike = css.getPropertyValue("--spike").trim();
+  const counted = css.getPropertyValue("--counted").trim();
+
+  function el(t, a) {
+    const e = document.createElementNS(NS, t);
+    for (const k in a) e.setAttribute(k, a[k]);
+    return e;
+  }
+  function text(tx, ty, s, anchor, size, fill) {
+    const e = el("text", {
+      x: tx, y: ty, "text-anchor": anchor || "start",
+      "font-family": "IBM Plex Mono, monospace",
+      "font-size": size || 9, fill: fill || soft
+    });
+    e.textContent = s;
+    return e;
+  }
+
+  // Panel A: raw fluorescence
+  const aTop = 16, aH = 100;
+  const tmin = Math.min(...tr), tmax = Math.max(...tr);
+  const ya = v => aTop + aH - ((v - tmin) / (tmax - tmin)) * aH;
+  svg.appendChild(el("line", { x1: L, y1: aTop + aH, x2: W - R, y2: aTop + aH, stroke: rule }));
+  let pa = "";
+  for (let i = 0; i < n; i++) pa += (i ? " L" : "M") + x(i).toFixed(1) + " " + ya(tr[i]).toFixed(1);
+  svg.appendChild(el("path", { d: pa, fill: "none", stroke: ink, "stroke-width": 1.3 }));
+  svg.appendChild(text(L, aTop - 4, "fluorescence  ΔF/F, cell 77", "start", 9.5, ink));
+  svg.appendChild(text(L - 6, ya(tmax) + 3, tmax.toFixed(2), "end"));
+  svg.appendChild(text(L - 6, ya(tmin) + 3, tmin.toFixed(2), "end"));
+
+  // Panel B: first difference with the threshold
+  const bTop = 150, bH = 92;
+  const dmax = Math.max(...df), dmin = Math.min(...df);
+  const yb = v => bTop + bH - ((v - dmin) / (dmax - dmin)) * bH;
+  svg.appendChild(el("line", { x1: L, y1: yb(0), x2: W - R, y2: yb(0), stroke: rule }));
+  let pb = "";
+  for (let i = 0; i < df.length; i++) pb += (i ? " L" : "M") + x(i).toFixed(1) + " " + yb(df[i]).toFixed(1);
+  svg.appendChild(el("path", { d: pb, fill: "none", stroke: ink, "stroke-width": 1.1 }));
+  svg.appendChild(el("line", {
+    x1: L, y1: yb(FIG.threshold), x2: W - R, y2: yb(FIG.threshold),
+    stroke: counted, "stroke-width": 1.2, "stroke-dasharray": "5 3"
+  }));
+  svg.appendChild(text(L, bTop - 4, "first difference  ΔF[n] − ΔF[n−1]", "start", 9.5, ink));
+  svg.appendChild(text(W - R, yb(FIG.threshold) - 4, "threshold  2.5σ = " + FIG.threshold.toFixed(3), "end", 9, counted));
+  svg.appendChild(text(L - 6, yb(dmax) + 3, dmax.toFixed(2), "end"));
+  svg.appendChild(text(L - 6, yb(0) + 3, "0", "end"));
+
+  // Panel C: the bits
+  const cTop = 268, cH = 22;
+  svg.appendChild(text(L, cTop - 6, "spike bits  rising edges only", "start", 9.5, ink));
+  svg.appendChild(el("rect", { x: L, y: cTop, width: iw, height: cH, fill: rule, opacity: 0.35, rx: 2 }));
+  let nspk = 0;
+  for (let i = 0; i < sp.length; i++) {
+    if (!sp[i]) continue;
+    nspk++;
+    svg.appendChild(el("rect", {
+      x: (x(i) - 1.6).toFixed(1), y: cTop, width: 3.2, height: cH, fill: spike
+    }));
+    svg.appendChild(el("line", {
+      x1: x(i).toFixed(1), y1: yb(FIG.threshold), x2: x(i).toFixed(1), y2: cTop,
+      stroke: spike, "stroke-width": 0.7, opacity: 0.45
+    }));
+  }
+  const secs = (n / 50).toFixed(1);
+  svg.appendChild(text(L, cTop + cH + 13, "frame " + FIG.start_frame.toLocaleString(), "start"));
+  svg.appendChild(text(W - R, cTop + cH + 13, secs + " s of recording →", "end"));
+
+  document.getElementById("pipecap").innerHTML =
+    "<b>" + n + " consecutive frames (" + secs + " s) of cell 77.</b> " +
+    "The trace drifts and decays; the difference does not. " + nspk +
+    " rising edges clear the threshold in this window. The dashed line is 2.5 robust " +
+    "standard deviations above this cell's own median derivative, " +
+    FIG.threshold.toFixed(3) + " in the file's units.";
+})();
+</script>

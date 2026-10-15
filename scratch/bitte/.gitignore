@@ -1,0 +1,4 @@
+# Compiled binaries; rebuild with the commands in README.md
+bench
+validate
+smoke

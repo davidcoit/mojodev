@@ -5,14 +5,33 @@ transfer entropy between two binary time series using bit-packed storage and
 almost nothing but AND / XOR / NOT / shift / popcount.
 
 ```
-bitte.mojo      the estimator
-gen.mojo        xorshift64* and the synthetic channels used for testing
-validate.mojo   correctness: vs a scalar oracle, and vs closed-form answers
-bench.mojo      cost measurements
-smoke.mojo      smallest end-to-end check
+bitte.mojo       the single-pair estimator
+network.mojo     all-pairs over a network of P signals (shared target masks)
+gen.mojo         xorshift64* and the synthetic channels used for testing
+validate.mojo    correctness: vs a scalar oracle, and vs closed-form answers
+netvalidate.mojo correctness: all-pairs vs single-pair, planted-network recovery
+bench.mojo       cost measurements
+smoke.mojo       smallest end-to-end check
 
-mojo build -O3 validate.mojo -o validate && ./validate
-mojo build -O3 bench.mojo    -o bench    && ./bench
+gpunet.mojo      GPU kernel, all-pairs, k = l = 1 (needs the max package)
+gpurun.mojo      GPU driver: verifies against CPU, times, scales in P
+```
+
+CPU, with the stock toolchain:
+
+```
+mojo build -O3 validate.mojo    -o validate    && ./validate
+mojo build -O3 netvalidate.mojo -o netvalidate && ./netvalidate
+mojo build -O3 bench.mojo       -o bench       && ./bench
+```
+
+GPU. The Mojo stdlib ships only GPU *detection* (`has_accelerator`,
+`is_nvidia_gpu`); `DeviceContext`, `barrier`, shared memory and kernel launch
+all live in the `max` package, so it needs its own toolchain:
+
+```
+python3 -m venv ../.venv-max && ../.venv-max/bin/pip install max==26.6.0
+../.venv-max/bin/mojo build -O3 gpurun.mojo -o gpurun && ./gpurun
 ```
 
 ## What it computes
@@ -160,6 +179,101 @@ fixed and changes only the algorithm.
 - **Sparse data** (p = 0.02) prunes hard — 0.2% live nodes at `k+l = 16` — which
   keeps the AND-tree at parity out to `k+l ≈ 14` instead of 7.
 
+## Networks of signals (`network.mojo`)
+
+For P signals there are `P(P-1)` ordered pairs, and running the single-pair
+estimator `P²` times repeats work. Of the `k+l+1` planes, `k+1` of them — the
+future plane and the k target-history planes — depend only on the *target*, and
+the plane order already walks those first. So for one target, descend them once
+and materialise the `2^(k+1)` masks they produce; every source reuses them.
+
+Those masks are a **partition** of the usable time axis (disjoint, covering),
+which buys a second saving: under a given target mask the deepest source level
+needs only `c1 = popcount(M & G)` and `c0 = |M| - c1`, so the final complement
+mask is never materialised at all — only its count.
+
+Plane passes over the time axis, per ordered pair:
+
+| | per-pair `BitTE` | `NetTE` | |
+|---|---|---|---|
+| k=l=1 | 12 | **4** | 3.0x |
+| k=2, l=1 | 24 | **8** | 3.0x |
+| k=1, l=2 | 24 | **16** | 1.5x |
+| k=l=2 | 48 | **32** | 1.5x |
+
+Measured at P=64, n=1e6, k=l=1: **2588 ms → 702 ms, 3.7x** (slightly better
+than the 3.0x the pass count predicts, since the shared target masks also cut
+plane re-slicing). The win is largest when `l` is small, which is the usual
+binary-network case.
+
+`./netvalidate` — all checks pass: **10,800 pair estimates** across
+`k,l,u ∈ 1..3`, P=5, four tile widths and lengths straddling the word boundary
+agree with the single-pair estimator to **4.4e-16**; every count table sums to
+`m`; and a planted 8-node network is recovered cleanly (planted edges 0.712 and
+0.118 bits, strongest absent edge 1.4e-5). Note the indirect path 0→1→2 shows
+**zero** TE at lag 1 and appears only at lag 2, which is correct — lag
+specificity, not a missed edge.
+
+## GPU (`gpunet.mojo`, `gpurun.mojo`)
+
+The network case is what a GPU is for: `P²` independent pairs, no cross-pair
+communication, and a dataset small enough to sit in L2 because it is bit-packed.
+
+**Mapping: one block per ordered pair.** Each thread strides over the time axis
+a word at a time, keeps the whole 3-plane tree in registers, and accumulates
+the eight counts of (y', y, x) in eight more registers; the block then folds
+its threads through eight shared bins and writes eight `Int32`. Consequences:
+
+- **No global atomics anywhere**, and no barriers in the hot loop. Every
+  thread's words are independent because the complement identity *and* the
+  count subtraction both hold per word — a thread never needs a neighbour's
+  totals.
+- It deliberately **gives up** the shared-target-mask trick above (8 passes per
+  pair instead of 4). Sharing would need either `P·8` shared bins and `P·8`
+  atomics per thread, or global atomics. On a GPU the arithmetic is free and
+  the atomics are not, so recomputing per pair is the better trade. This is the
+  one place where the best CPU algorithm is *not* the best GPU algorithm.
+
+Measured, P=64, n=1e6, k=l=1, RTX 3080 (verified: GPU counts match the CPU
+estimator with worst difference **0.0**, and all 4032 count tables sum to `m`):
+
+| | time | vs GPU |
+|---|---|---|
+| GPU kernel (best of 5) | **4.05 ms** | — |
+| CPU `NetTE` | 702 ms | 173x |
+| CPU per-pair `BitTE` | 2588 ms | **640x** |
+
+Upload of all 64 packed signals (7.8 MB) is **4.9 ms**, so the whole analysis is
+~9 ms end to end. Scaling in network size, at ~1.0 µs/pair:
+
+| P | pairs | kernel | µs/pair | CPU extrapolated |
+|---|---|---|---|---|
+| 8 | 56 | 0.12 ms | 2.13 | 0.04 s |
+| 32 | 992 | 0.92 ms | 0.93 | 0.6 s |
+| 64 | 4032 | 4.09 ms | 1.02 | 2.6 s |
+| 128 | 16256 | 16.3 ms | 1.00 | 10.4 s |
+| 256 | 65280 | **61.2 ms** | 0.94 | 42 s |
+
+Flat per-pair cost from P=32 (≈1000 blocks) upward — the GPU saturates there
+and is then linear in pair count. A 256-node network at 1M samples is 61 ms.
+
+### Two environment traps, both costly
+
+- **Pinned host buffers are catastrophic under WSL2 here.**
+  `enqueue_create_host_buffer` + copy took **2257 ms** for 7.8 MB (~0.3 s/MB),
+  500x the kernel. Copying straight from `List` memory with
+  `ctx.enqueue_copy(buf, lst.unsafe_ptr())` takes **4.9 ms** — a 458x
+  difference, and it would have silently dominated every measurement.
+- **Kernel scalar args must be fixed-width.** `Int`/`UInt` do not conform to
+  `DevicePassable`; the error surfaces as a wall of template-instantiation
+  noise ending in "use a fixed-width type such as Int32". Use `Int32`.
+
+### What a GPU does not fix
+
+The `k+l ≈ 7` crossover is arithmetic, not hardware: a GPU accelerates the
+AND-tree and the scalar walk by similar factors. GPU raises throughput; it does
+not extend the method to larger state spaces.
+
 ## Honest limits
 
 - Only useful for small `k+l`. That happens to be the regime binary TE is
@@ -167,9 +281,18 @@ fixed and changes only the algorithm.
   but the method does not scale in state space and should not pretend to.
 - Plug-in and Miller–Madow only. No Bayesian or NSB estimator, no bootstrap
   confidence interval beyond the rotation null.
-- Single-threaded. Tiles are independent, so `sync_parallelize` over tiles with
-  per-thread count tables is the obvious next step; so is SIMD-widening the
-  mask loops from `UInt64` to `SIMD[DType.uint64, 4]`.
+- The CPU paths are single-threaded. Tiles are independent, so
+  `sync_parallelize` over tiles with per-thread count tables is the obvious
+  next step; so is SIMD-widening the mask loops from `UInt64` to
+  `SIMD[DType.uint64, 4]`.
+- The GPU kernel is specialised to `k = l = 1` (any lag). Generalising means
+  `2^(k+1)` mask registers and a `comptime`-unrolled source descent — the
+  register budget is fine to about `k+l = 7`, which is the whole useful range,
+  but it is not written yet.
+- No GPU path for the lag scan or the rotation-surrogate null, which is the
+  single most promising remaining target: both reuse the same resident planes
+  at a different read offset, so a grid over (pair × lag × surrogate) would run
+  thousands of independent counts over data that never leaves the device.
 - `set_lag` requires the window reserved at construction via `umax`, since TE
   values are only comparable across lags on the same sample window.
 
